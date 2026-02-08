@@ -564,7 +564,7 @@ def detect_chapter_boundary(doc, current_idx, chapter_context, is_image_based):
         print(f"[Warning] Error detecting chapter boundary at page {current_idx}: {e}")
         return False, {}
 
-def sequential_reading_agent(doc, is_image_based, start_idx=0, max_pages_per_part=50):
+def sequential_reading_agent(doc, is_image_based, start_idx=0, max_pages_per_part=35):
     """
     Sequential reading agent that reads page-by-page to detect chapters.
     Returns a list of parts with their page ranges.
@@ -757,7 +757,7 @@ def generate_split_plan(toc_structure, total_physical_pages, offset, max_pages_p
 # MODULE 8: Adaptive Strategy Selector
 # ==============================================================================
 
-def choose_chunking_strategy(doc, is_image_based, max_pages_per_part=50):
+def choose_chunking_strategy(doc, is_image_based, max_pages_per_part=35):
     """
     Intelligently chooses between TOC-based and Sequential reading strategies.
     Returns (strategy, data) where strategy is 'toc' or 'sequential'.
@@ -891,13 +891,13 @@ def execute_split(doc, plan, offset, output_dir="book_parts"):
 # MAIN ORCHESTRATOR
 # ==============================================================================
 
-def process_book(pdf_path, max_pages_per_part=50, output_dir="book_parts", force_strategy=None):
+def process_book(pdf_path, max_pages_per_part=35, output_dir="book_parts", force_strategy=None):
     """
     Main orchestrator with adaptive strategy selection.
 
     Args:
         pdf_path: Path to the PDF file
-        max_pages_per_part: Maximum pages per part (default: 50)
+        max_pages_per_part: Maximum pages per part (default: 35)
         output_dir: Output directory (default: "book_parts")
         force_strategy: Force a specific strategy ('toc' or 'sequential'), or None for auto-selection
     """
@@ -995,8 +995,8 @@ Examples:
     parser.add_argument(
         "--max-pages",
         type=int,
-        default=50,
-        help="Maximum pages per part (default: 50)"
+        default=35,
+        help="Maximum pages per part (default: 35)"
     )
 
     parser.add_argument(

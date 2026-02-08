@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "learning-buddy"
+version = "0.1.0"
+description = "Workflow engine for processing PDFs into NotebookLM learning artifacts."
+readme = "BRAINSTORM.md"
+requires-python = ">=3.10"
+dependencies = [
+  "PyMuPDF>=1.24.0",
+]
+
+[project.scripts]
+learning-buddy = "learning_buddy.cli:main"
+
+[tool.setuptools]
+packages = ["learning_buddy"]
