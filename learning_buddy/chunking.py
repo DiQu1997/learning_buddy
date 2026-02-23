@@ -46,10 +46,11 @@ def run_book_chunker(pdf_path: Path, max_pages: int, output_dir: Path) -> list[C
         "--output-dir",
         str(output_dir),
     ]
-    proc = subprocess.run(command, capture_output=True, text=True)
+    proc = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if proc.stdout:
+        print(proc.stdout, flush=True)
     if proc.returncode != 0:
-        merged = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        raise RuntimeError(f"book_chunker.py failed for {pdf_path}:\n{merged.strip()}")
+        raise RuntimeError(f"book_chunker.py failed for {pdf_path}:\n{(proc.stdout or '').strip()}")
 
     chunks = sorted(output_dir.glob("*.pdf"))
     if not chunks:

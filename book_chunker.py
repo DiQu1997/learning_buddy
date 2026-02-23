@@ -63,6 +63,35 @@ def get_page_content_for_llm(doc, page_idx, is_image_based):
         return f"Page Index: {page_idx}.\n\n{text}"
 
 # ==============================================================================
+# MODULE 1.5: PDF Metadata ToC Extraction
+# ==============================================================================
+
+def extract_toc_from_metadata(doc):
+    """
+    Attempts to extract Table of Contents from PDF metadata/outline (bookmarks).
+    PyMuPDF's doc.get_toc() returns [[level, title, page], ...] where page is 1-based physical page number.
+    Returns structured ToC list compatible with extract_toc_structure() output, or None if unavailable.
+    """
+    toc = doc.get_toc()
+
+    if not toc:
+        return None
+
+    structured_toc = []
+    for level, title, page in toc:
+        if page > 0 and title.strip():
+            structured_toc.append({
+                "title": title.strip(),
+                "level": min(level, 2),  # Cap at level 2 to match expected format
+                "page_number": page       # 1-based physical page number
+            })
+
+    if len(structured_toc) < 3:
+        return None
+
+    return structured_toc
+
+# ==============================================================================
 # MODULE 2: Table of Contents (ToC) Locator
 # ==============================================================================
 
@@ -767,6 +796,20 @@ def choose_chunking_strategy(doc, is_image_based, max_pages_per_part=35):
     print("="*70)
 
     try:
+        # Step 0: Check PDF metadata for embedded ToC (bookmarks/outline)
+        print("\n[Step 0] Checking PDF metadata for Table of Contents...")
+        metadata_toc = extract_toc_from_metadata(doc)
+        if metadata_toc:
+            print(f"[Step 0] ✓ Found {len(metadata_toc)} entries in PDF metadata ToC")
+            print("[Decision] Using TOC from PDF metadata (no LLM calls needed)")
+            # Metadata page numbers are 1-based physical pages, offset = -1 for 0-based indexing
+            return 'toc', {
+                'toc_structure': metadata_toc,
+                'offset': -1,
+                'total_pages': len(doc)
+            }
+        print("[Step 0] No ToC in PDF metadata, proceeding with content analysis...")
+
         # Step 1: Try to find TOC
         print("\n[Step 1] Attempting to locate Table of Contents...")
         toc_start, toc_end = find_toc_range(doc, is_image_based)
@@ -916,15 +959,24 @@ def process_book(pdf_path, max_pages_per_part=35, output_dir="book_parts", force
                 strategy_data = {'doc': doc, 'is_image_based': is_image_based}
             else:
                 strategy = 'toc'
-                # Still need to extract TOC for forced TOC strategy
-                toc_start, toc_end = find_toc_range(doc, is_image_based)
-                toc_structure = extract_toc_structure(doc, toc_start, toc_end, is_image_based)
-                offset = calculate_offset_by_anchor(doc, toc_structure, toc_end, is_image_based)
-                strategy_data = {
-                    'toc_structure': toc_structure,
-                    'offset': offset,
-                    'total_pages': len(doc)
-                }
+                # Try metadata ToC first, fall back to LLM-based extraction
+                metadata_toc = extract_toc_from_metadata(doc)
+                if metadata_toc:
+                    print("[System] Using ToC from PDF metadata")
+                    strategy_data = {
+                        'toc_structure': metadata_toc,
+                        'offset': -1,
+                        'total_pages': len(doc)
+                    }
+                else:
+                    toc_start, toc_end = find_toc_range(doc, is_image_based)
+                    toc_structure = extract_toc_structure(doc, toc_start, toc_end, is_image_based)
+                    offset = calculate_offset_by_anchor(doc, toc_structure, toc_end, is_image_based)
+                    strategy_data = {
+                        'toc_structure': toc_structure,
+                        'offset': offset,
+                        'total_pages': len(doc)
+                    }
         else:
             strategy, strategy_data = choose_chunking_strategy(doc, is_image_based, max_pages_per_part)
 
