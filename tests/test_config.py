@@ -20,6 +20,13 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             cfg.resolve_artifacts(["unknown"])
 
+    def test_rate_control_defaults(self) -> None:
+        cfg = EngineConfig.from_dict({})
+        self.assertEqual(cfg.max_concurrent_generations, 2)
+        self.assertEqual(cfg.courtesy_delay_seconds, 5)
+        self.assertEqual(cfg.nlm_min_request_interval_seconds, 1.0)
+        self.assertTrue(cfg.cleanup_failed_remote_artifacts)
+
 
 if __name__ == "__main__":
     unittest.main()

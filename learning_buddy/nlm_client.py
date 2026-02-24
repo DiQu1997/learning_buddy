@@ -36,6 +36,7 @@ class NLMCLI:
         "401",
     )
     RATE_MARKERS = ("rate limit exceeded", "http 429", "too many requests", "429")
+    NOT_FOUND_MARKERS = ("not found", "404", "does not exist", "missing")
     ID_LINE_PATTERNS = (
         re.compile(r"Artifact ID:\s*([A-Za-z0-9_\-]+)", re.IGNORECASE),
         re.compile(r"Source ID:\s*([A-Za-z0-9_\-]+)", re.IGNORECASE),
@@ -50,12 +51,15 @@ class NLMCLI:
         backoff_base_seconds: int = 30,
         backoff_multiplier: int = 2,
         max_retries: int = 3,
+        min_request_interval_seconds: float = 1.0,
         logger: Callable[[str], None] | None = None,
     ):
         self.command = command
         self.backoff_base_seconds = backoff_base_seconds
         self.backoff_multiplier = backoff_multiplier
         self.max_retries = max_retries
+        self.min_request_interval_seconds = max(0.0, float(min_request_interval_seconds))
+        self._last_command_finished_at: float | None = None
         self.logger = logger
 
     def _log(self, message: str) -> None:
@@ -238,6 +242,18 @@ class NLMCLI:
         args = ["download", dl_type, notebook_id, "--id", artifact_id, "--output", str(output_path)]
         self._run(args, retries=min(self.max_retries, 2))
 
+    def delete_artifact(self, notebook_id: str, artifact_id: str, *, ignore_missing: bool = True) -> bool:
+        try:
+            self._run(
+                ["studio", "delete", notebook_id, artifact_id, "--confirm"],
+                retries=self.max_retries,
+            )
+            return True
+        except NLMError as exc:
+            if ignore_missing and self._is_missing_error(str(exc)):
+                return False
+            raise
+
     def query_notebook(self, notebook_id: str, question: str) -> str:
         return self._run(["notebook", "query", notebook_id, question], retries=0)
 
@@ -250,7 +266,9 @@ class NLMCLI:
         self._log(f"Running: {cmd_text}")
         attempt = 0
         while True:
+            self._throttle_request()
             proc = subprocess.run(command, capture_output=True, text=True)
+            self._last_command_finished_at = time.monotonic()
             stdout = proc.stdout or ""
             stderr = proc.stderr or ""
             merged = (stdout + "\n" + stderr).strip()
@@ -399,3 +417,19 @@ class NLMCLI:
     def _is_rate_limited(self, text: str) -> bool:
         token = text.lower()
         return any(marker in token for marker in self.RATE_MARKERS)
+
+    def _is_missing_error(self, text: str) -> bool:
+        token = text.lower()
+        return any(marker in token for marker in self.NOT_FOUND_MARKERS)
+
+    def _throttle_request(self) -> None:
+        if self.min_request_interval_seconds <= 0:
+            return
+        if self._last_command_finished_at is None:
+            return
+        elapsed = time.monotonic() - self._last_command_finished_at
+        if elapsed >= self.min_request_interval_seconds:
+            return
+        sleep_for = self.min_request_interval_seconds - elapsed
+        self._log(f"Throttling NLM command cadence: sleeping {sleep_for:.2f}s.")
+        time.sleep(sleep_for)

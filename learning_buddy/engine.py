@@ -239,6 +239,7 @@ class WorkflowEngine:
             config_dict=config_dict,
             output_dir=output_dir,
         )
+        self._apply_nlm_runtime_config(cfg)
 
         for artifact_type in artifact_values:
             format_detail = self._format_detail(artifact_type, cfg)
@@ -284,6 +285,7 @@ class WorkflowEngine:
         return self._write_job_summary(job_id)
 
     def _run_job(self, context: JobContext, *, input_paths: list[Path], force_from_stage: str | None) -> None:
+        self._apply_nlm_runtime_config(context.config)
         context.output_dir.mkdir(parents=True, exist_ok=True)
         self._log("Entering workflow pipeline.", job_id=context.job_id)
 
@@ -308,13 +310,25 @@ class WorkflowEngine:
         self._write_job_summary(context.job_id)
 
     def _maybe_stage_classify_chunk(self, context: JobContext, input_paths: list[Path]) -> None:
+        job = self.db.get_job(context.job_id)
+        job_status = str(job["status"]) if job else ""
         existing_sources = self.db.list_sources_for_job(context.job_id)
         if existing_sources:
-            self._log(
-                f"Skipping INPUT/CLASSIFY/CHUNK because {len(existing_sources)} source records already exist.",
-                job_id=context.job_id,
-            )
-            return
+            if job_status in {"CLASSIFYING", "CHUNKING"}:
+                reset_count = self.db.reset_upload_stage(context.job_id)
+                chunks_dir = context.output_dir / "chunks"
+                if chunks_dir.exists():
+                    shutil.rmtree(chunks_dir)
+                self._log(
+                    f"Detected interrupted {job_status} stage; reset {reset_count} partial upload/source record(s).",
+                    job_id=context.job_id,
+                )
+            else:
+                self._log(
+                    f"Skipping INPUT/CLASSIFY/CHUNK because {len(existing_sources)} source records already exist.",
+                    job_id=context.job_id,
+                )
+                return
 
         self.db.update_job_status(context.job_id, "CLASSIFYING", error=None)
         self._log("Stage CLASSIFY started.", job_id=context.job_id)
@@ -448,7 +462,7 @@ class WorkflowEngine:
                 )
                 continue
 
-            if str(task["status"]) == "FAILED" and int(task["attempts"]) >= 2:
+            if str(task["status"]) == "FAILED" and int(task["attempts"]) >= context.config.max_retries:
                 self._log(
                     f"UPLOAD task {task_id} skipped after retry limit.",
                     job_id=context.job_id,
@@ -514,6 +528,8 @@ class WorkflowEngine:
                 task_id = self.db.ensure_task(context.job_id, "GENERATE", artifact_ref, status="QUEUED")
                 task = self.db.get_task(task_id)
                 if task and str(task["status"]) == "FAILED" and int(task["attempts"]) < context.config.max_retries:
+                    if context.config.cleanup_failed_remote_artifacts:
+                        self._cleanup_failed_remote_artifact(context, artifact_ref=artifact_ref, task_id=task_id)
                     self.db.update_task_status(task_id, "QUEUED", error=None)
                     self._log(
                         f"Re-queued GENERATE task {task_id} after previous failure.",
@@ -759,6 +775,33 @@ class WorkflowEngine:
             return None
         return matches[-1]
 
+    def _cleanup_failed_remote_artifact(self, context: JobContext, *, artifact_ref: str, task_id: str) -> None:
+        artifact = self.db.get_artifact_by_ref(artifact_ref)
+        if not artifact:
+            return
+        artifact_id = str(artifact["artifact_id"] or "")
+        if not artifact_id:
+            return
+
+        try:
+            removed = self.nlm.delete_artifact(context.notebook_id, artifact_id, ignore_missing=True)
+            self.db.clear_artifact_remote_id(artifact_ref)
+            if removed:
+                self._log(
+                    f"Deleted failed remote artifact {artifact_id} before retrying GENERATE task {task_id}.",
+                    job_id=context.job_id,
+                )
+            else:
+                self._log(
+                    f"Remote artifact {artifact_id} already absent before retrying GENERATE task {task_id}.",
+                    job_id=context.job_id,
+                )
+        except Exception as exc:
+            self._log(
+                f"Could not delete failed remote artifact {artifact_id} before retrying task {task_id}: {exc}",
+                job_id=context.job_id,
+            )
+
     def _stage_download(self, context: JobContext) -> None:
         self.db.update_job_status(context.job_id, "DOWNLOADING", error=None)
         self._log("Stage DOWNLOAD started. Checking NotebookLM authentication.", job_id=context.job_id)
@@ -774,7 +817,7 @@ class WorkflowEngine:
             status = str(task["status"])
             attempts = int(task["attempts"])
 
-            if status == "FAILED" and attempts >= 2:
+            if status == "FAILED" and attempts >= context.config.max_retries:
                 self._log(
                     f"DOWNLOAD task {task_id} skipped after retry limit.",
                     job_id=context.job_id,
@@ -941,3 +984,9 @@ class WorkflowEngine:
             except ValueError:
                 continue
         return None
+
+    def _apply_nlm_runtime_config(self, cfg: EngineConfig) -> None:
+        self.nlm.backoff_base_seconds = max(1, int(cfg.backoff_base_seconds))
+        self.nlm.backoff_multiplier = max(1, int(cfg.backoff_multiplier))
+        self.nlm.max_retries = max(1, int(cfg.max_retries))
+        self.nlm.min_request_interval_seconds = max(0.0, float(cfg.nlm_min_request_interval_seconds))

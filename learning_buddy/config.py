@@ -20,13 +20,15 @@ DEFAULT_CONFIG = {
         "infographic",
     ],
     "report_format": "Study Guide",
-    "max_concurrent_generations": 3,
-    "courtesy_delay_seconds": 3,
+    "max_concurrent_generations": 2,
+    "courtesy_delay_seconds": 5,
     "poll_interval_seconds": 30,
     "poll_max_wait_seconds": 600,
     "backoff_base_seconds": 30,
     "backoff_multiplier": 2,
     "max_retries": 3,
+    "nlm_min_request_interval_seconds": 1.0,
+    "cleanup_failed_remote_artifacts": True,
 }
 
 
@@ -51,13 +53,15 @@ class EngineConfig:
         default_factory=lambda: ["audio", "video", "quiz", "flashcards", "mind_map", "infographic"]
     )
     report_format: str = "Study Guide"
-    max_concurrent_generations: int = 3
-    courtesy_delay_seconds: int = 3
+    max_concurrent_generations: int = 2
+    courtesy_delay_seconds: int = 5
     poll_interval_seconds: int = 30
     poll_max_wait_seconds: int = 600
     backoff_base_seconds: int = 30
     backoff_multiplier: int = 2
     max_retries: int = 3
+    nlm_min_request_interval_seconds: float = 1.0
+    cleanup_failed_remote_artifacts: bool = True
 
     @classmethod
     def from_dict(cls, payload: dict) -> "EngineConfig":
@@ -81,6 +85,8 @@ class EngineConfig:
             "backoff_base_seconds": self.backoff_base_seconds,
             "backoff_multiplier": self.backoff_multiplier,
             "max_retries": self.max_retries,
+            "nlm_min_request_interval_seconds": self.nlm_min_request_interval_seconds,
+            "cleanup_failed_remote_artifacts": self.cleanup_failed_remote_artifacts,
         }
 
     def resolve_artifacts(self, requested: Iterable[str] | None) -> list[str]:

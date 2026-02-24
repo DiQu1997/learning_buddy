@@ -356,6 +356,13 @@ class LearningBuddyDB:
         )
         self.conn.commit()
 
+    def clear_artifact_remote_id(self, artifact_ref: str) -> None:
+        self.conn.execute(
+            "UPDATE artifacts SET artifact_id = NULL WHERE id = ?",
+            (artifact_ref,),
+        )
+        self.conn.commit()
+
     def update_artifact_download_path(self, artifact_ref: str, download_path: str) -> None:
         self.conn.execute(
             "UPDATE artifacts SET download_path = ? WHERE id = ?",
@@ -441,6 +448,30 @@ class LearningBuddyDB:
             )
         self.conn.commit()
 
+    def reset_upload_stage(self, job_id: str) -> int:
+        rows = self._fetchall(
+            """
+            SELECT target_ref
+            FROM tasks
+            WHERE job_id = ? AND task_type = 'UPLOAD'
+            """,
+            (job_id,),
+        )
+        source_refs = sorted({str(row["target_ref"]) for row in rows})
+
+        self.conn.execute(
+            "DELETE FROM tasks WHERE job_id = ? AND task_type = 'UPLOAD'",
+            (job_id,),
+        )
+        if source_refs:
+            placeholders = ",".join("?" for _ in source_refs)
+            self.conn.execute(
+                f"DELETE FROM sources WHERE id IN ({placeholders})",
+                tuple(source_refs),
+            )
+        self.conn.commit()
+        return len(source_refs)
+
     def count_tasks(self, job_id: str, task_type: str, status: str) -> int:
         row = self._fetchone(
             """
@@ -469,4 +500,3 @@ class LearningBuddyDB:
             (notebook_id,),
         )
         return {str(row["artifact_id"]) for row in rows}
-
