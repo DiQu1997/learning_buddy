@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Iterable
 
 
@@ -27,7 +27,7 @@ DEFAULT_CONFIG = {
     "backoff_base_seconds": 30,
     "backoff_multiplier": 2,
     "max_retries": 3,
-    "nlm_min_request_interval_seconds": 1.0,
+    "nlm_request_interval_range": [0.5, 1.5],
     "cleanup_failed_remote_artifacts": True,
 }
 
@@ -60,7 +60,7 @@ class EngineConfig:
     backoff_base_seconds: int = 30
     backoff_multiplier: int = 2
     max_retries: int = 3
-    nlm_min_request_interval_seconds: float = 1.0
+    nlm_request_interval_range: list[float] = field(default_factory=lambda: [0.5, 1.5])
     cleanup_failed_remote_artifacts: bool = True
 
     @classmethod
@@ -69,7 +69,10 @@ class EngineConfig:
         data.update(payload or {})
         data["default_artifacts"] = list(data.get("default_artifacts", []))
         data["extended_artifacts"] = list(data.get("extended_artifacts", []))
-        return cls(**data)
+        data["nlm_request_interval_range"] = list(data.get("nlm_request_interval_range", [0.5, 1.5]))
+        allowed = {item.name for item in fields(cls)}
+        filtered = {key: value for key, value in data.items() if key in allowed}
+        return cls(**filtered)
 
     def to_dict(self) -> dict:
         return {
@@ -85,7 +88,7 @@ class EngineConfig:
             "backoff_base_seconds": self.backoff_base_seconds,
             "backoff_multiplier": self.backoff_multiplier,
             "max_retries": self.max_retries,
-            "nlm_min_request_interval_seconds": self.nlm_min_request_interval_seconds,
+            "nlm_request_interval_range": list(self.nlm_request_interval_range),
             "cleanup_failed_remote_artifacts": self.cleanup_failed_remote_artifacts,
         }
 

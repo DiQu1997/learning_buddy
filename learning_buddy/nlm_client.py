@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import re
 import subprocess
 import time
@@ -51,14 +52,15 @@ class NLMCLI:
         backoff_base_seconds: int = 30,
         backoff_multiplier: int = 2,
         max_retries: int = 3,
-        min_request_interval_seconds: float = 1.0,
+        request_interval_range: tuple[float, float] = (0.5, 1.5),
         logger: Callable[[str], None] | None = None,
     ):
         self.command = command
         self.backoff_base_seconds = backoff_base_seconds
         self.backoff_multiplier = backoff_multiplier
         self.max_retries = max_retries
-        self.min_request_interval_seconds = max(0.0, float(min_request_interval_seconds))
+        lo, hi = request_interval_range
+        self._request_interval_range = (max(0.0, float(lo)), max(0.0, float(hi)))
         self._last_command_finished_at: float | None = None
         self.logger = logger
 
@@ -423,13 +425,15 @@ class NLMCLI:
         return any(marker in token for marker in self.NOT_FOUND_MARKERS)
 
     def _throttle_request(self) -> None:
-        if self.min_request_interval_seconds <= 0:
+        lo, hi = self._request_interval_range
+        if hi <= 0:
             return
         if self._last_command_finished_at is None:
             return
+        min_gap = random.uniform(lo, hi)
         elapsed = time.monotonic() - self._last_command_finished_at
-        if elapsed >= self.min_request_interval_seconds:
+        if elapsed >= min_gap:
             return
-        sleep_for = self.min_request_interval_seconds - elapsed
+        sleep_for = min_gap - elapsed
         self._log(f"Throttling NLM command cadence: sleeping {sleep_for:.2f}s.")
         time.sleep(sleep_for)

@@ -160,8 +160,240 @@ class WorkflowEngine:
         payload["tasks"] = self.db.task_counts(job_id)
         return payload
 
+    def inspect(
+        self,
+        *,
+        job_id: str | None = None,
+        limit: int = 10,
+        include_completed: bool = False,
+        include_task_details: bool = True,
+        pending_limit: int = 25,
+    ) -> dict[str, Any]:
+        rows = [self.db.get_job(job_id)] if job_id else list(self.db.list_jobs(limit=max(1, limit)))
+        jobs = [row for row in rows if row is not None]
+        if job_id and not jobs:
+            raise ValueError(f"Job not found: {job_id}")
+
+        snapshots: list[dict[str, Any]] = []
+        for job_row in jobs:
+            snapshot = self._build_job_inspection(
+                dict(job_row),
+                include_task_details=include_task_details,
+                pending_limit=pending_limit,
+            )
+            if not include_completed and not job_id and snapshot["job"]["status"] == "DONE":
+                continue
+            snapshots.append(snapshot)
+
+        jobs_with_remaining = sum(1 for item in snapshots if item["remaining"]["total_actionable_tasks"] > 0)
+        jobs_blocked = sum(1 for item in snapshots if item["remaining"]["terminal_failures"] > 0)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "workspace": str(self.workspace),
+            "db_path": str(self.db_path),
+            "filters": {
+                "job_id": job_id,
+                "limit": limit,
+                "include_completed": include_completed,
+                "include_task_details": include_task_details,
+                "pending_limit": pending_limit,
+            },
+            "jobs_returned": len(snapshots),
+            "summary": {
+                "jobs_with_remaining_work": jobs_with_remaining,
+                "jobs_blocked_by_terminal_failures": jobs_blocked,
+            },
+            "jobs": snapshots,
+        }
+
     def library(self, *, tag: str | None = None, doc_type: str | None = None) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.list_notebooks(tag=tag, doc_type=doc_type)]
+
+    def _build_job_inspection(
+        self,
+        job: dict[str, Any],
+        *,
+        include_task_details: bool,
+        pending_limit: int,
+    ) -> dict[str, Any]:
+        job_id = str(job["id"])
+        config_dict = json.loads(job["config"])
+        cfg = EngineConfig.from_dict(config_dict)
+        max_retries = cfg.max_retries
+
+        notebook = self.db.get_notebook_by_ref(str(job["notebook_ref"])) if job.get("notebook_ref") else None
+        sources = [dict(row) for row in self.db.list_sources_for_job(job_id)]
+        artifacts = [dict(row) for row in self.db.list_artifacts_for_job(job_id)]
+        tasks = [dict(row) for row in self.db.list_tasks(job_id)]
+
+        source_by_ref = {str(row["id"]): row for row in sources}
+        artifact_by_ref = {str(row["id"]): row for row in artifacts}
+
+        task_types = ("UPLOAD", "GENERATE", "DOWNLOAD")
+        tasks_by_type: dict[str, list[dict[str, Any]]] = {task_type: [] for task_type in task_types}
+        for task in tasks:
+            task_type = str(task["task_type"])
+            tasks_by_type.setdefault(task_type, []).append(task)
+
+        task_stats = {task_type: self._task_breakdown(rows, max_retries=max_retries) for task_type, rows in tasks_by_type.items()}
+        task_stats["ALL"] = self._task_breakdown(tasks, max_retries=max_retries)
+
+        remaining = {
+            "upload_remaining": task_stats.get("UPLOAD", {}).get("remaining_actionable", 0),
+            "generate_remaining": task_stats.get("GENERATE", {}).get("remaining_actionable", 0),
+            "download_remaining": task_stats.get("DOWNLOAD", {}).get("remaining_actionable", 0),
+            "total_actionable_tasks": task_stats["ALL"]["remaining_actionable"],
+            "terminal_failures": task_stats["ALL"]["terminal_failed"],
+        }
+
+        next_actions: list[str] = []
+        if remaining["total_actionable_tasks"] > 0:
+            next_actions.append(f"Resume job: learning-buddy resume {job_id}")
+        if remaining["terminal_failures"] > 0:
+            next_actions.append("Inspect terminal failures and fix root cause before retrying.")
+        if not next_actions:
+            next_actions.append("No remaining actionable tasks.")
+
+        pending_rows: list[dict[str, Any]] = []
+        pending_total = 0
+        pending_truncated = False
+        if include_task_details:
+            pending_rows, pending_total, pending_truncated = self._pending_task_rows(
+                tasks=tasks,
+                source_by_ref=source_by_ref,
+                artifact_by_ref=artifact_by_ref,
+                limit=max(1, pending_limit),
+            )
+
+        return {
+            "job": {
+                "id": job_id,
+                "status": str(job["status"]),
+                "error": job.get("error"),
+                "created_at": job.get("created_at"),
+                "updated_at": job.get("updated_at"),
+            },
+            "config": {
+                "max_retries": cfg.max_retries,
+                "max_concurrent_generations": cfg.max_concurrent_generations,
+                "courtesy_delay_seconds": cfg.courtesy_delay_seconds,
+                "poll_interval_seconds": cfg.poll_interval_seconds,
+                "poll_max_wait_seconds": cfg.poll_max_wait_seconds,
+                "nlm_request_interval_range": cfg.nlm_request_interval_range,
+            },
+            "notebook": {
+                "local_id": notebook["id"] if notebook else None,
+                "notebook_id": notebook["notebook_id"] if notebook else None,
+                "name": notebook["name"] if notebook else None,
+                "public_url": notebook["public_url"] if notebook else None,
+            },
+            "counts": {
+                "sources_total": len(sources),
+                "sources_uploaded": sum(1 for row in sources if row.get("source_id")),
+                "sources_remaining": sum(1 for row in sources if not row.get("source_id")),
+                "artifacts_total": len(artifacts),
+                "artifacts_with_remote_id": sum(1 for row in artifacts if row.get("artifact_id")),
+                "artifacts_downloaded": sum(1 for row in artifacts if row.get("download_path")),
+            },
+            "tasks": task_stats,
+            "remaining": remaining,
+            "next_actions": next_actions,
+            "pending_tasks": {
+                "total": pending_total,
+                "truncated": pending_truncated,
+                "rows": pending_rows,
+            },
+        }
+
+    @staticmethod
+    def _task_breakdown(tasks: list[dict[str, Any]], *, max_retries: int) -> dict[str, Any]:
+        status_counts = {"QUEUED": 0, "IN_PROGRESS": 0, "COMPLETED": 0, "FAILED": 0}
+        retryable_failed = 0
+        terminal_failed = 0
+        for task in tasks:
+            status = str(task.get("status") or "").upper()
+            if status not in status_counts:
+                status_counts[status] = 0
+            status_counts[status] += 1
+            if status == "FAILED":
+                attempts = int(task.get("attempts") or 0)
+                if attempts < max_retries:
+                    retryable_failed += 1
+                else:
+                    terminal_failed += 1
+
+        total = len(tasks)
+        completed = status_counts.get("COMPLETED", 0)
+        remaining_actionable = (
+            status_counts.get("QUEUED", 0) + status_counts.get("IN_PROGRESS", 0) + retryable_failed
+        )
+        completion_ratio = round((completed / total) if total else 1.0, 4)
+        return {
+            "total": total,
+            "queued": status_counts.get("QUEUED", 0),
+            "in_progress": status_counts.get("IN_PROGRESS", 0),
+            "completed": completed,
+            "failed": status_counts.get("FAILED", 0),
+            "retryable_failed": retryable_failed,
+            "terminal_failed": terminal_failed,
+            "remaining_actionable": remaining_actionable,
+            "completion_ratio": completion_ratio,
+        }
+
+    def _pending_task_rows(
+        self,
+        *,
+        tasks: list[dict[str, Any]],
+        source_by_ref: dict[str, dict[str, Any]],
+        artifact_by_ref: dict[str, dict[str, Any]],
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], int, bool]:
+        status_rank = {"IN_PROGRESS": 0, "FAILED": 1, "QUEUED": 2}
+        pending = [row for row in tasks if str(row.get("status") or "").upper() in status_rank]
+        pending.sort(
+            key=lambda row: (
+                status_rank.get(str(row.get("status") or "").upper(), 9),
+                str(row.get("task_type") or ""),
+                str(row.get("updated_at") or ""),
+            )
+        )
+
+        truncated = len(pending) > limit
+        result: list[dict[str, Any]] = []
+        for task in pending[:limit]:
+            task_type = str(task.get("task_type") or "")
+            target_ref = str(task.get("target_ref") or "")
+            target: dict[str, Any]
+            if task_type == "UPLOAD":
+                source = source_by_ref.get(target_ref) or self.db.get_source_by_ref(target_ref)
+                target = {
+                    "source_ref": target_ref,
+                    "title": source["title"] if source else None,
+                    "source_id": source["source_id"] if source else None,
+                    "file_path": source["file_path"] if source else None,
+                    "page_range": source["page_range"] if source else None,
+                }
+            else:
+                artifact = artifact_by_ref.get(target_ref) or self.db.get_artifact_by_ref(target_ref)
+                target = {
+                    "artifact_ref": target_ref,
+                    "artifact_type": artifact["artifact_type"] if artifact else None,
+                    "artifact_id": artifact["artifact_id"] if artifact else None,
+                    "source_id": artifact["source_id"] if artifact else None,
+                    "download_path": artifact["download_path"] if artifact else None,
+                }
+            result.append(
+                {
+                    "id": str(task.get("id") or ""),
+                    "task_type": task_type,
+                    "status": str(task.get("status") or ""),
+                    "attempts": int(task.get("attempts") or 0),
+                    "error": task.get("error"),
+                    "updated_at": task.get("updated_at"),
+                    "target": target,
+                }
+            )
+        return result, len(pending), truncated
 
     def info(self, notebook_identifier: str) -> dict[str, Any]:
         notebook = self._resolve_notebook(notebook_identifier)
@@ -989,4 +1221,5 @@ class WorkflowEngine:
         self.nlm.backoff_base_seconds = max(1, int(cfg.backoff_base_seconds))
         self.nlm.backoff_multiplier = max(1, int(cfg.backoff_multiplier))
         self.nlm.max_retries = max(1, int(cfg.max_retries))
-        self.nlm.min_request_interval_seconds = max(0.0, float(cfg.nlm_min_request_interval_seconds))
+        lo, hi = cfg.nlm_request_interval_range
+        self.nlm._request_interval_range = (max(0.0, float(lo)), max(0.0, float(hi)))

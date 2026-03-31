@@ -24,8 +24,19 @@ class ConfigTests(unittest.TestCase):
         cfg = EngineConfig.from_dict({})
         self.assertEqual(cfg.max_concurrent_generations, 2)
         self.assertEqual(cfg.courtesy_delay_seconds, 5)
-        self.assertEqual(cfg.nlm_min_request_interval_seconds, 1.0)
+        self.assertEqual(cfg.nlm_request_interval_range, [0.5, 1.5])
         self.assertTrue(cfg.cleanup_failed_remote_artifacts)
+
+    def test_from_dict_ignores_unknown_keys(self) -> None:
+        cfg = EngineConfig.from_dict(
+            {
+                "artifact_types": ["report"],
+                "output_dir": "/tmp/out",
+                "job_name": "demo",
+                "max_retries": 5,
+            }
+        )
+        self.assertEqual(cfg.max_retries, 5)
 
 
 if __name__ == "__main__":

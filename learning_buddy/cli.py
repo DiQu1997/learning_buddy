@@ -27,6 +27,26 @@ def build_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="Show job status.")
     status.add_argument("job_id", help="Job ID.")
 
+    inspect = sub.add_parser("inspect", help="Inspect workflow DB with structured progress output.")
+    inspect.add_argument("job_id", nargs="?", help="Optional job ID. If omitted, recent jobs are returned.")
+    inspect.add_argument("--limit", type=int, default=10, help="Max recent jobs when job_id is omitted.")
+    inspect.add_argument(
+        "--include-completed",
+        action="store_true",
+        help="Include jobs already in DONE state in list mode.",
+    )
+    inspect.add_argument(
+        "--pending-limit",
+        type=int,
+        default=25,
+        help="Max pending task rows included per job.",
+    )
+    inspect.add_argument(
+        "--no-task-details",
+        action="store_true",
+        help="Disable pending task row details and return counts only.",
+    )
+
     resume = sub.add_parser("resume", help="Resume a failed or interrupted job.")
     resume.add_argument("job_id", help="Job ID.")
 
@@ -86,6 +106,18 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "status":
             _emit(engine.status(args.job_id))
+            return 0
+
+        if args.command == "inspect":
+            _emit(
+                engine.inspect(
+                    job_id=args.job_id,
+                    limit=args.limit,
+                    include_completed=args.include_completed,
+                    include_task_details=not args.no_task_details,
+                    pending_limit=args.pending_limit,
+                )
+            )
             return 0
 
         if args.command == "resume":
