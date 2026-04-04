@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .chunking import ChunkSpec, classify_pdf, copy_as_single_chunk, fallback_fixed_size_split, run_book_chunker
+from .chunking import ChunkSpec, SUPPORTED_INPUT_SUFFIXES, chunk_document, classify_document, materialize_single_source, upload_extension_for_source
 from .config import DEFAULT_CONFIG, EngineConfig, normalize_artifact_type
 from .db import LearningBuddyDB
 from .nlm_client import NLMAuthError, NLMCLI, NLMError, StudioArtifact
@@ -76,7 +76,7 @@ class WorkflowEngine:
         validated_paths = self._validate_inputs(input_paths)
         tags = tags or []
         self._log(
-            f"Starting process job for {len(validated_paths)} PDF(s): "
+            f"Starting process job for {len(validated_paths)} document(s): "
             + ", ".join(path.name for path in validated_paths)
         )
         self._log(
@@ -88,13 +88,13 @@ class WorkflowEngine:
             cfg.max_pages_per_chunk = max_pages
         artifact_types = cfg.resolve_artifacts(artifacts)
 
-        page_counts = [classify_pdf(path, cfg.chunk_threshold)[0] for path in validated_paths]
+        page_counts = [classify_document(path, cfg.chunk_threshold)[0] for path in validated_paths]
         doc_type = self._infer_doc_type(validated_paths, page_counts, cfg.chunk_threshold)
 
         job_name = name or validated_paths[0].stem
         job_name = slugify(job_name, fallback="job")
         output_dir = (self.output_root / job_name).resolve()
-        description = f"Learning materials from {len(validated_paths)} PDF file(s)"
+        description = f"Learning materials from {len(validated_paths)} document file(s)"
         self._log(
             f"Resolved config: chunk_threshold={cfg.chunk_threshold}, max_pages_per_chunk={cfg.max_pages_per_chunk}, "
             f"artifacts={artifact_types}, output_dir={output_dir}"
@@ -566,11 +566,11 @@ class WorkflowEngine:
         self._log("Stage CLASSIFY started.", job_id=context.job_id)
         classified: list[tuple[Path, int, bool]] = []
         for path in input_paths:
-            pages, needs_chunking = classify_pdf(path, context.config.chunk_threshold)
+            pages, needs_chunking = classify_document(path, context.config.chunk_threshold)
             classified.append((path, pages, needs_chunking))
             decision = "chunk" if needs_chunking else "no-chunk"
             self._log(
-                f"Classified '{path.name}': pages={pages}, threshold={context.config.chunk_threshold}, decision={decision}.",
+                f"Classified '{path.name}': size_units={pages}, threshold={context.config.chunk_threshold}, decision={decision}.",
                 job_id=context.job_id,
             )
 
@@ -581,21 +581,23 @@ class WorkflowEngine:
 
         source_index = 0
         multi = len(classified) > 1
-        for pdf_path, _, needs_chunking in classified:
+        for source_path, _, needs_chunking in classified:
             if needs_chunking:
                 self._log(
-                    f"Chunking '{pdf_path.name}' using book_chunker/fallback path.",
+                    f"Chunking '{source_path.name}' using format-specific chunking.",
                     job_id=context.job_id,
                 )
-                raw_chunks = self._chunk_document(pdf_path, context)
+                raw_chunks = self._chunk_document(source_path, context)
                 self._log(
-                    f"Chunking produced {len(raw_chunks)} part(s) for '{pdf_path.name}'.",
+                    f"Chunking produced {len(raw_chunks)} part(s) for '{source_path.name}'.",
                     job_id=context.job_id,
                 )
                 for spec in raw_chunks:
                     source_index += 1
-                    title = spec.title if not multi else f"{pdf_path.stem} - {spec.title}"
-                    filename = f"{source_index:02d}_{slugify(title, fallback='chunk')}.pdf"
+                    title = spec.title if not multi else f"{source_path.stem} - {spec.title}"
+                    filename = (
+                        f"{source_index:02d}_{slugify(title, fallback='chunk')}{spec.file_path.suffix.lower() or '.txt'}"
+                    )
                     final_path = chunks_dir / filename
                     ensure_parent(final_path)
                     if spec.file_path.resolve() != final_path.resolve():
@@ -605,30 +607,30 @@ class WorkflowEngine:
                         title=title,
                         source_index=source_index,
                         file_path=str(final_path),
-                        original_pdf=str(pdf_path),
+                        original_pdf=str(source_path),
                         page_range=spec.page_range,
                         is_chunk=True,
                     )
                     self.db.ensure_task(context.job_id, "UPLOAD", source_ref, status="QUEUED")
-                temp_dir = context.output_dir / "chunks" / f".{slugify(pdf_path.stem, fallback='pdf')}_parts"
+                temp_dir = context.output_dir / "chunks" / f".{slugify(source_path.stem, fallback='source')}_parts"
                 if temp_dir.exists():
                     shutil.rmtree(temp_dir)
             else:
                 self._log(
-                    f"Skipping chunking for '{pdf_path.name}' (single source path).",
+                    f"Skipping chunking for '{source_path.name}' (single source path).",
                     job_id=context.job_id,
                 )
                 source_index += 1
-                title = pdf_path.stem
-                filename = f"{source_index:02d}_{slugify(title, fallback='document')}.pdf"
+                title = source_path.stem
+                filename = f"{source_index:02d}_{slugify(title, fallback='document')}{upload_extension_for_source(source_path)}"
                 final_path = chunks_dir / filename
-                copy_as_single_chunk(pdf_path, final_path)
+                materialize_single_source(source_path, final_path)
                 source_ref = self.db.create_source(
                     notebook_id=None,
                     title=title,
                     source_index=source_index,
                     file_path=str(final_path),
-                    original_pdf=str(pdf_path),
+                    original_pdf=str(source_path),
                     page_range=None,
                     is_chunk=False,
                 )
@@ -636,24 +638,23 @@ class WorkflowEngine:
         upload_tasks = self.db.list_tasks(context.job_id, task_type="UPLOAD")
         self._log(f"Prepared {len(upload_tasks)} UPLOAD task(s).", job_id=context.job_id)
 
-    def _chunk_document(self, pdf_path: Path, context: JobContext) -> list[ChunkSpec]:
-        temp_dir = context.output_dir / "chunks" / f".{slugify(pdf_path.stem, fallback='pdf')}_parts"
+    def _chunk_document(self, source_path: Path, context: JobContext) -> list[ChunkSpec]:
+        temp_dir = context.output_dir / "chunks" / f".{slugify(source_path.stem, fallback='source')}_parts"
         if temp_dir.exists():
             shutil.rmtree(temp_dir)
         temp_dir.mkdir(parents=True, exist_ok=True)
 
-        try:
+        if source_path.suffix.lower() == ".pdf":
             self._log(
-                f"Running book_chunker.py for '{pdf_path.name}' (max_pages={context.config.max_pages_per_chunk}).",
+                f"Running PDF chunker for '{source_path.name}' (max_pages={context.config.max_pages_per_chunk}).",
                 job_id=context.job_id,
             )
-            return run_book_chunker(pdf_path, context.config.max_pages_per_chunk, temp_dir)
-        except Exception as exc:
+        else:
             self._log(
-                f"book_chunker.py failed for '{pdf_path.name}': {exc}. Falling back to fixed-size split.",
+                f"Parsing EPUB structure for '{source_path.name}' (max_pages={context.config.max_pages_per_chunk}).",
                 job_id=context.job_id,
             )
-            return fallback_fixed_size_split(pdf_path, context.config.max_pages_per_chunk, temp_dir)
+        return chunk_document(source_path, context.config.max_pages_per_chunk, temp_dir)
 
     def _stage_upload(self, context: JobContext) -> None:
         self.db.update_job_status(context.job_id, "UPLOADING", error=None)
@@ -1143,16 +1144,17 @@ class WorkflowEngine:
 
     def _validate_inputs(self, input_paths: list[str]) -> list[Path]:
         if not input_paths:
-            raise ValueError("At least one PDF input path is required.")
+            raise ValueError("At least one input path is required.")
         result: list[Path] = []
         for item in input_paths:
             path = Path(item).expanduser().resolve()
             if not path.exists():
                 raise FileNotFoundError(f"Input file not found: {path}")
-            if path.suffix.lower() != ".pdf":
-                raise ValueError(f"Input is not a PDF: {path}")
             if not path.is_file():
                 raise ValueError(f"Input path is not a file: {path}")
+            if path.suffix.lower() not in SUPPORTED_INPUT_SUFFIXES:
+                supported = ", ".join(sorted(SUPPORTED_INPUT_SUFFIXES))
+                raise ValueError(f"Unsupported input type for {path}. Expected one of: {supported}")
             result.append(path)
         return result
 

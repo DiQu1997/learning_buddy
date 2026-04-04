@@ -13,12 +13,12 @@ from .utils import parse_json_list
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="learning-buddy",
-        description="State-machine workflow engine for PDF -> NotebookLM learning artifacts.",
+        description="State-machine workflow engine for PDF/EPUB -> NotebookLM learning artifacts.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    process = sub.add_parser("process", help="Process one or more PDFs end-to-end.")
-    process.add_argument("pdfs", nargs="+", help="Input PDF paths.")
+    process = sub.add_parser("process", help="Process one or more documents end-to-end.")
+    process.add_argument("inputs", nargs="+", help="Input PDF or EPUB paths.")
     process.add_argument("--name", help="Notebook/job name.")
     process.add_argument("--max-pages", type=int, help="Max pages per chunk.")
     process.add_argument("--artifacts", help="Comma-separated artifact list.")
@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
             artifacts = parse_json_list(args.artifacts)
             tags = parse_json_list(args.tags)
             result = engine.process(
-                input_paths=list(args.pdfs),
+                input_paths=list(args.inputs),
                 name=args.name,
                 tags=tags,
                 artifacts=artifacts or None,
