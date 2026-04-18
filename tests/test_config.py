@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import unittest
 
-from learning_buddy.config import EngineConfig
+from learning_buddy.config import DEFAULT_NOTE_PROMPT, EngineConfig
 
 
 class ConfigTests(unittest.TestCase):
     def test_default_artifacts(self) -> None:
         cfg = EngineConfig.from_dict({})
-        self.assertEqual(cfg.resolve_artifacts(None), ["report", "slide_deck"])
+        self.assertEqual(cfg.resolve_artifacts(None), ["report", "slide_deck", "video", "note"])
+        self.assertEqual(cfg.note_prompt, DEFAULT_NOTE_PROMPT)
 
     def test_artifact_normalization(self) -> None:
         cfg = EngineConfig.from_dict({})
-        resolved = cfg.resolve_artifacts(["slides", "mindmap", "audio"])
-        self.assertEqual(resolved, ["slide_deck", "mind_map", "audio"])
+        resolved = cfg.resolve_artifacts(["slides", "mindmap", "audio", "notes"])
+        self.assertEqual(resolved, ["slide_deck", "mind_map", "audio", "note"])
 
     def test_invalid_artifact(self) -> None:
         cfg = EngineConfig.from_dict({})

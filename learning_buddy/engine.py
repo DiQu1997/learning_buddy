@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .chunking import ChunkSpec, SUPPORTED_INPUT_SUFFIXES, chunk_document, classify_document, materialize_single_source, upload_extension_for_source
-from .config import DEFAULT_CONFIG, EngineConfig, normalize_artifact_type
+from .config import DEFAULT_CONFIG, EngineConfig, normalize_artifact_type, remote_artifact_type
 from .db import LearningBuddyDB
 from .nlm_client import NLMAuthError, NLMCLI, NLMError, StudioArtifact
 from .utils import ensure_parent, slugify
@@ -796,13 +796,25 @@ class WorkflowEngine:
         )
 
         while pending or inflight:
-            while pending and len(inflight) < context.config.max_concurrent_generations:
-                task = pending.popleft()
-                started = self._start_generate_task(context, dict(task))
-                if started:
-                    inflight[str(task["id"])] = time.monotonic()
-                    if pending and len(inflight) < context.config.max_concurrent_generations:
-                        await asyncio.sleep(context.config.courtesy_delay_seconds)
+            open_slots = context.config.max_concurrent_generations - len(inflight)
+            while pending and open_slots > 0:
+                started_this_pass = False
+                pending_count = len(pending)
+                for _ in range(pending_count):
+                    task = pending.popleft()
+                    if self._has_generation_conflict(context, dict(task), inflight):
+                        pending.append(task)
+                        continue
+                    started = self._start_generate_task(context, dict(task))
+                    if started:
+                        inflight[str(task["id"])] = time.monotonic()
+                        started_this_pass = True
+                        open_slots -= 1
+                        if pending and open_slots > 0:
+                            await asyncio.sleep(context.config.courtesy_delay_seconds)
+                    break
+                if not started_this_pass:
+                    break
 
             if inflight:
                 self.db.update_job_status(context.job_id, "POLLING", error=None)
@@ -836,6 +848,39 @@ class WorkflowEngine:
             inflight[str(task["id"])] = time.monotonic() - elapsed
         return inflight
 
+    def _has_generation_conflict(
+        self,
+        context: JobContext,
+        task: dict[str, Any],
+        inflight: dict[str, float],
+    ) -> bool:
+        artifact = self.db.get_artifact_by_ref(str(task["target_ref"]))
+        if not artifact:
+            return False
+
+        source_id = str(artifact["source_id"] or "")
+        remote_type = remote_artifact_type(str(artifact["artifact_type"]))
+        if not source_id:
+            return False
+
+        for inflight_task_id in inflight:
+            inflight_task = self.db.get_task(inflight_task_id)
+            if not inflight_task:
+                continue
+            inflight_artifact = self.db.get_artifact_by_ref(str(inflight_task["target_ref"]))
+            if not inflight_artifact:
+                continue
+            if str(inflight_artifact["source_id"] or "") != source_id:
+                continue
+            if remote_artifact_type(str(inflight_artifact["artifact_type"])) != remote_type:
+                continue
+            self._log(
+                f"Delaying GENERATE task {task['id']} because another {remote_type} artifact for source_id={source_id} is still in progress.",
+                job_id=context.job_id,
+            )
+            return True
+        return False
+
     def _start_generate_task(self, context: JobContext, task: dict[str, Any]) -> bool:
         task_id = str(task["id"])
         artifact_ref = str(task["target_ref"])
@@ -868,6 +913,7 @@ class WorkflowEngine:
                 artifact_type=artifact_type,
                 source_id=source_id,
                 report_format=context.config.report_format,
+                note_prompt=context.config.note_prompt,
             )
             if artifact_id:
                 self.db.update_artifact_remote_id(artifact_ref, artifact_id)
@@ -995,11 +1041,12 @@ class WorkflowEngine:
         used_ids: set[str],
     ) -> StudioArtifact | None:
         normalized_type = normalize_artifact_type(artifact_type)
+        remote_type = remote_artifact_type(normalized_type)
         matches: list[StudioArtifact] = []
         for item in statuses:
             if item.artifact_id in used_ids:
                 continue
-            if item.artifact_type and normalize_artifact_type(item.artifact_type) != normalized_type:
+            if item.artifact_type and remote_artifact_type(item.artifact_type) != remote_type:
                 continue
             if item.source_ids and source_id not in item.source_ids:
                 continue
@@ -1101,37 +1148,61 @@ class WorkflowEngine:
     def _artifact_output_path(self, *, output_dir: Path, artifact: dict[str, Any]) -> Path:
         source_id = str(artifact.get("source_id") or "")
         source_label = "notebook"
+        source_record: dict[str, Any] | None = None
         if source_id:
             source = self.db.get_source_by_remote_id(source_id)
             if source:
-                source_label = f"{int(source['source_index']):02d}_{slugify(str(source['title'] or 'source'))}"
+                source_record = dict(source)
+                source_label = self._source_output_label(source_record)
 
         artifact_type = normalize_artifact_type(str(artifact["artifact_type"]))
-        filename = self._artifact_filename(artifact_type)
+        filename = self._artifact_filename(artifact_type, source=source_record)
         return output_dir / "artifacts" / source_label / filename
 
-    def _artifact_filename(self, artifact_type: str) -> str:
+    def _source_output_label(self, source: dict[str, Any]) -> str:
+        return f"{int(source['source_index']):02d}_{slugify(str(source['title'] or 'source'))}"
+
+    def _artifact_source_stem(self, source: dict[str, Any] | None) -> str:
+        if not source:
+            return "notebook"
+
+        original_path = Path(str(source.get("original_pdf") or source.get("file_path") or "source"))
+        original_slug = slugify(original_path.stem or "source", fallback="source")
+        title_slug = slugify(str(source.get("title") or original_path.stem or "source"), fallback="source")
+
+        prefix = f"{int(source['source_index']):02d}_{original_slug}"
+        if title_slug == original_slug:
+            return prefix
+        return f"{prefix}__{title_slug}"
+
+    def _artifact_filename(self, artifact_type: str, *, source: dict[str, Any] | None = None) -> str:
+        base = self._artifact_source_stem(source)
         if artifact_type == "report":
-            return "study_guide.md"
+            return f"{base}__study_guide.md"
+        if artifact_type == "note":
+            return f"{base}__reading_note.md"
         if artifact_type == "slide_deck":
-            return "slides.txt"
+            return f"{base}__slides.txt"
         if artifact_type == "audio":
-            return "podcast.mp3"
+            return f"{base}__podcast.mp3"
         if artifact_type == "video":
-            return "video.mp4"
+            return f"{base}__video.mp4"
         if artifact_type == "quiz":
-            return "quiz.json"
+            return f"{base}__quiz.json"
         if artifact_type == "flashcards":
-            return "flashcards.json"
+            return f"{base}__flashcards.json"
         if artifact_type == "mind_map":
-            return "mind_map.txt"
+            return f"{base}__mind_map.txt"
         if artifact_type == "infographic":
-            return "infographic.png"
-        return f"{artifact_type}.bin"
+            return f"{base}__infographic.png"
+        return f"{base}__{artifact_type}.bin"
 
     def _format_detail(self, artifact_type: str, cfg: EngineConfig) -> str | None:
-        if normalize_artifact_type(artifact_type) == "report":
+        normalized = normalize_artifact_type(artifact_type)
+        if normalized == "report":
             return cfg.report_format
+        if normalized == "note":
+            return "Create Your Own"
         return None
 
     def _resolve_notebook(self, identifier: str) -> dict[str, Any]:

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import normalize_artifact_type
+from .config import normalize_artifact_type, remote_artifact_type
 from .utils import try_load_json
 
 
@@ -170,8 +170,10 @@ class NLMCLI:
         source_id: str,
         *,
         report_format: str,
+        note_prompt: str,
     ) -> str | None:
         normalized_type = normalize_artifact_type(artifact_type)
+        remote_type = remote_artifact_type(normalized_type)
         before = self.list_studio_status(notebook_id)
         before_ids = {item.artifact_id for item in before}
 
@@ -180,6 +182,7 @@ class NLMCLI:
             artifact_type=normalized_type,
             source_id=source_id,
             report_format=report_format,
+            note_prompt=note_prompt,
         )
         output = self._run(cmd, retries=self.max_retries)
         artifact_id = self._extract_id(output, allow_generic_id=False)
@@ -189,7 +192,7 @@ class NLMCLI:
         after = self.list_studio_status(notebook_id)
         candidate = self._find_matching_artifact(
             artifacts=after,
-            artifact_type=normalized_type,
+            artifact_type=remote_type,
             source_id=source_id,
             exclude_ids=before_ids,
         )
@@ -338,7 +341,7 @@ class NLMCLI:
         for item in artifacts:
             if item.artifact_id in exclude_ids:
                 continue
-            if item.artifact_type and normalize_artifact_type(item.artifact_type) != normalize_artifact_type(artifact_type):
+            if item.artifact_type and remote_artifact_type(item.artifact_type) != remote_artifact_type(artifact_type):
                 continue
             if item.source_ids and source_id not in item.source_ids:
                 continue
@@ -354,6 +357,7 @@ class NLMCLI:
         artifact_type: str,
         source_id: str,
         report_format: str,
+        note_prompt: str,
     ) -> list[str]:
         if artifact_type == "report":
             return [
@@ -362,6 +366,19 @@ class NLMCLI:
                 notebook_id,
                 "--format",
                 report_format,
+                "--source-ids",
+                source_id,
+                "--confirm",
+            ]
+        if artifact_type == "note":
+            return [
+                "report",
+                "create",
+                notebook_id,
+                "--format",
+                "Create Your Own",
+                "--prompt",
+                note_prompt,
                 "--source-ids",
                 source_id,
                 "--confirm",
@@ -383,7 +400,7 @@ class NLMCLI:
         raise NLMError(f"Unsupported artifact type: {artifact_type}")
 
     def _download_type(self, artifact_type: str) -> str:
-        token = normalize_artifact_type(artifact_type)
+        token = remote_artifact_type(artifact_type)
         if token == "slide_deck":
             return "slide-deck"
         if token == "mind_map":

@@ -10,7 +10,7 @@ It accepts local `PDF` and `EPUB` files, decides whether each document should be
 - Supports `PDF` and `EPUB` inputs
 - Chunks long documents before upload
 - Uploads sources to NotebookLM through the `nlm` CLI
-- Generates artifacts such as study guides, slide decks, audio, quizzes, and more
+- Generates artifacts such as study guides, reading notes, slide decks, videos, audio, quizzes, and more
 - Stores job, source, and artifact metadata in `.learning_buddy/workflow.db`
 - Supports resuming interrupted jobs
 
@@ -147,11 +147,12 @@ By default, each uploaded source gets:
 
 - `report`
 - `slide_deck`
+- `video`
+- `note`
 
 Additional supported artifact types:
 
 - `audio`
-- `video`
 - `quiz`
 - `flashcards`
 - `mind_map`
@@ -160,7 +161,7 @@ Additional supported artifact types:
 Example:
 
 ```bash
-learning-buddy process ./book.epub --artifacts report,slide_deck,audio,flashcards
+learning-buddy process ./book.epub --artifacts report,slide_deck,video,note,audio,flashcards
 ```
 
 ## CLI Reference
@@ -303,9 +304,10 @@ output/<job-name>/
 │   ├── 02_<source>.pdf|txt
 ├── artifacts/
 │   ├── 01_<source-title>/
-│   │   ├── study_guide.md
-│   │   ├── slides.txt
-│   │   ├── podcast.mp3
+│   │   ├── 01_<resource-file>__<source-title>__study_guide.md
+│   │   ├── 01_<resource-file>__<source-title>__reading_note.md
+│   │   ├── 01_<resource-file>__<source-title>__slides.txt
+│   │   ├── 01_<resource-file>__<source-title>__video.mp4
 │   │   └── ...
 └── job_summary.json
 ```
