@@ -34,10 +34,11 @@ class NLMCLI:
         "cookies have expired",
         "authentication may have expired",
         "unauthorized",
-        "401",
+        "http 401",
+        "401 unauthorized",
     )
-    RATE_MARKERS = ("rate limit exceeded", "http 429", "too many requests", "429")
-    NOT_FOUND_MARKERS = ("not found", "404", "does not exist", "missing")
+    RATE_MARKERS = ("rate limit exceeded", "http 429", "too many requests", "429 too many requests")
+    NOT_FOUND_MARKERS = ("not found", "http 404", "404 not found", "does not exist", "missing")
     ID_LINE_PATTERNS = (
         re.compile(r"Artifact ID:\s*([A-Za-z0-9_\-]+)", re.IGNORECASE),
         re.compile(r"Source ID:\s*([A-Za-z0-9_\-]+)", re.IGNORECASE),

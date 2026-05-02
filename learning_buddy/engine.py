@@ -432,15 +432,17 @@ class WorkflowEngine:
         return {"artifact_id": artifact_id, "path": str(output_path)}
 
     def generate_for_source(self, source_identifier: str, artifact_types: list[str]) -> dict[str, Any]:
-        source = self.db.get_source_by_remote_id(source_identifier) or self.db.get_source_by_ref(source_identifier)
-        if not source:
+        source_row = self.db.get_source_by_remote_id(source_identifier) or self.db.get_source_by_ref(source_identifier)
+        if not source_row:
             raise ValueError(f"Source not found: {source_identifier}")
+        source = dict(source_row)
         if not source["source_id"]:
             raise ValueError(f"Source has not been uploaded to NotebookLM: {source_identifier}")
 
-        notebook = self.db.find_notebook(str(source["notebook_id"]))
-        if not notebook:
+        notebook_row = self.db.find_notebook(str(source["notebook_id"]))
+        if not notebook_row:
             raise ValueError(f"Notebook not found for source: {source_identifier}")
+        notebook = dict(notebook_row)
         if not notebook["notebook_id"]:
             raise ValueError(f"Notebook has no NotebookLM ID: {source_identifier}")
 
