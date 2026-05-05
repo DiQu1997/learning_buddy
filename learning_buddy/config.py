@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
-from typing import Iterable
+import json
+import os
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 
 DEFAULT_NOTE_PROMPT = """你将把一篇文章重写成"阅读版本" ，输出简体中文和英文两个版本，按内容主题分成若干小节；目标是让读者通过阅读就能完整理解文章讲了什么，就好像是在读一篇 Blog 版的文章一样。
@@ -33,36 +35,6 @@ DEFAULT_NOTE_PROMPT = """你将把一篇文章重写成"阅读版本" ，输出�
 -回答的任何部分都不要出现繁体中文"""
 
 
-DEFAULT_CONFIG = {
-    "max_pages_per_chunk": 50,
-    "chunk_threshold": 50,
-    "default_artifacts": [
-        "report",
-        "slide_deck",
-        "video",
-        "note",
-    ],
-    "extended_artifacts": [
-        "audio",
-        "quiz",
-        "flashcards",
-        "mind_map",
-        "infographic",
-    ],
-    "report_format": "Study Guide",
-    "note_prompt": DEFAULT_NOTE_PROMPT,
-    "max_concurrent_generations": 2,
-    "courtesy_delay_seconds": 5,
-    "poll_interval_seconds": 30,
-    "poll_max_wait_seconds": 600,
-    "backoff_base_seconds": 30,
-    "backoff_multiplier": 2,
-    "max_retries": 3,
-    "nlm_request_interval_range": [0.5, 1.5],
-    "cleanup_failed_remote_artifacts": True,
-}
-
-
 ALL_ARTIFACT_TYPES = (
     "report",
     "note",
@@ -76,71 +48,7 @@ ALL_ARTIFACT_TYPES = (
 )
 
 
-@dataclass
-class EngineConfig:
-    max_pages_per_chunk: int = 50
-    chunk_threshold: int = 50
-    default_artifacts: list[str] = field(default_factory=lambda: ["report", "slide_deck", "video", "note"])
-    extended_artifacts: list[str] = field(
-        default_factory=lambda: ["audio", "quiz", "flashcards", "mind_map", "infographic"]
-    )
-    report_format: str = "Study Guide"
-    note_prompt: str = DEFAULT_NOTE_PROMPT
-    max_concurrent_generations: int = 2
-    courtesy_delay_seconds: int = 5
-    poll_interval_seconds: int = 30
-    poll_max_wait_seconds: int = 600
-    backoff_base_seconds: int = 30
-    backoff_multiplier: int = 2
-    max_retries: int = 3
-    nlm_request_interval_range: list[float] = field(default_factory=lambda: [0.5, 1.5])
-    cleanup_failed_remote_artifacts: bool = True
-
-    @classmethod
-    def from_dict(cls, payload: dict) -> "EngineConfig":
-        data = dict(DEFAULT_CONFIG)
-        data.update(payload or {})
-        data["default_artifacts"] = list(data.get("default_artifacts", []))
-        data["extended_artifacts"] = list(data.get("extended_artifacts", []))
-        data["nlm_request_interval_range"] = list(data.get("nlm_request_interval_range", [0.5, 1.5]))
-        allowed = {item.name for item in fields(cls)}
-        filtered = {key: value for key, value in data.items() if key in allowed}
-        return cls(**filtered)
-
-    def to_dict(self) -> dict:
-        return {
-            "max_pages_per_chunk": self.max_pages_per_chunk,
-            "chunk_threshold": self.chunk_threshold,
-            "default_artifacts": list(self.default_artifacts),
-            "extended_artifacts": list(self.extended_artifacts),
-            "report_format": self.report_format,
-            "note_prompt": self.note_prompt,
-            "max_concurrent_generations": self.max_concurrent_generations,
-            "courtesy_delay_seconds": self.courtesy_delay_seconds,
-            "poll_interval_seconds": self.poll_interval_seconds,
-            "poll_max_wait_seconds": self.poll_max_wait_seconds,
-            "backoff_base_seconds": self.backoff_base_seconds,
-            "backoff_multiplier": self.backoff_multiplier,
-            "max_retries": self.max_retries,
-            "nlm_request_interval_range": list(self.nlm_request_interval_range),
-            "cleanup_failed_remote_artifacts": self.cleanup_failed_remote_artifacts,
-        }
-
-    def resolve_artifacts(self, requested: Iterable[str] | None) -> list[str]:
-        if requested is None:
-            values = list(self.default_artifacts)
-        else:
-            values = [item.strip() for item in requested if item and item.strip()]
-        normalized: list[str] = []
-        for item in values:
-            key = normalize_artifact_type(item)
-            if key not in ALL_ARTIFACT_TYPES:
-                raise ValueError(f"Unsupported artifact type: {item}")
-            if key not in normalized:
-                normalized.append(key)
-        if not normalized:
-            raise ValueError("At least one artifact type is required.")
-        return normalized
+DEFAULT_ARTIFACTS = ["note", "slide_deck", "video", "audio", "mind_map"]
 
 
 def normalize_artifact_type(value: str) -> str:
@@ -159,3 +67,128 @@ def remote_artifact_type(value: str) -> str:
     if token == "note":
         return "report"
     return token
+
+
+@dataclass
+class SplitConfig:
+    min_pages_to_split: int = 35
+    max_pages_per_chunk: int = 25
+
+
+@dataclass
+class LLMConfig:
+    model: str = "gpt-5-mini"
+    classify_excerpt_pages: int = 3
+
+
+@dataclass
+class NLMConfig:
+    poll_interval_seconds: int = 30
+    poll_max_wait_seconds: int = 1800
+    backoff_base_seconds: int = 30
+    backoff_multiplier: int = 2
+    max_retries: int = 3
+    request_interval_range: list[float] = field(default_factory=lambda: [0.5, 1.5])
+
+
+@dataclass
+class AppConfig:
+    inbox: str = ""
+    library: str = ""
+    database: str = ""
+    git_remote: str = ""
+    auto_push: bool = False
+    bucket_capacity: int = 25
+    artifacts: list[str] = field(default_factory=lambda: list(DEFAULT_ARTIFACTS))
+    note_prompt: str = DEFAULT_NOTE_PROMPT
+    split: SplitConfig = field(default_factory=SplitConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
+    nlm: NLMConfig = field(default_factory=NLMConfig)
+
+    @classmethod
+    def from_dict(cls, payload: dict | None) -> "AppConfig":
+        payload = payload or {}
+        return cls(
+            inbox=str(payload.get("inbox", "")),
+            library=str(payload.get("library", "")),
+            database=str(payload.get("database", "")),
+            git_remote=str(payload.get("git_remote", "")),
+            auto_push=bool(payload.get("auto_push", False)),
+            bucket_capacity=int(payload.get("bucket_capacity", 25)),
+            artifacts=[normalize_artifact_type(x) for x in (payload.get("artifacts") or DEFAULT_ARTIFACTS)],
+            note_prompt=str(payload.get("note_prompt") or DEFAULT_NOTE_PROMPT),
+            split=SplitConfig(**(payload.get("split") or {})),
+            llm=LLMConfig(**(payload.get("llm") or {})),
+            nlm=NLMConfig(**(payload.get("nlm") or {})),
+        )
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        data["artifacts"] = list(self.artifacts)
+        return data
+
+    def resolved_paths(self) -> dict[str, Path]:
+        if not self.inbox or not self.library or not self.database:
+            raise ValueError(
+                "inbox, library, and database paths must all be set. "
+                "Run `learning-buddy config set <key> <value>`."
+            )
+        return {
+            "inbox": Path(self.inbox).expanduser(),
+            "library": Path(self.library).expanduser(),
+            "database": Path(self.database).expanduser(),
+        }
+
+
+def default_config_path() -> Path:
+    override = os.environ.get("LEARNING_BUDDY_CONFIG")
+    if override:
+        return Path(override).expanduser()
+    home = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    return home / "learning-buddy" / "config.json"
+
+
+def load_config(path: Path | None = None) -> AppConfig:
+    target = Path(path) if path else default_config_path()
+    if not target.exists():
+        return AppConfig.from_dict({})
+    return AppConfig.from_dict(json.loads(target.read_text(encoding="utf-8")))
+
+
+def save_config(config: AppConfig, path: Path | None = None) -> Path:
+    target = Path(path) if path else default_config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(config.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
+    return target
+
+
+_NESTED_KEYS = {
+    "split.min_pages_to_split": ("split", "min_pages_to_split", int),
+    "split.max_pages_per_chunk": ("split", "max_pages_per_chunk", int),
+    "llm.model": ("llm", "model", str),
+    "llm.classify_excerpt_pages": ("llm", "classify_excerpt_pages", int),
+    "nlm.poll_interval_seconds": ("nlm", "poll_interval_seconds", int),
+    "nlm.poll_max_wait_seconds": ("nlm", "poll_max_wait_seconds", int),
+    "nlm.backoff_base_seconds": ("nlm", "backoff_base_seconds", int),
+    "nlm.max_retries": ("nlm", "max_retries", int),
+}
+
+
+def apply_kv_update(config: AppConfig, key: str, value: str) -> None:
+    if key in {"inbox", "library", "database", "git_remote", "note_prompt"}:
+        setattr(config, key, value)
+        return
+    if key == "auto_push":
+        setattr(config, key, value.lower() in {"1", "true", "yes", "y"})
+        return
+    if key == "bucket_capacity":
+        config.bucket_capacity = int(value)
+        return
+    if key == "artifacts":
+        config.artifacts = [normalize_artifact_type(item) for item in value.split(",") if item.strip()]
+        return
+    if key in _NESTED_KEYS:
+        section, attr, caster = _NESTED_KEYS[key]
+        setattr(getattr(config, section), attr, caster(value))
+        return
+    raise KeyError(f"Unknown config key: {key}")
