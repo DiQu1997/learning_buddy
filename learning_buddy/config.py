@@ -78,16 +78,14 @@ class SplitConfig:
 @dataclass
 class LLMConfig:
     model: str = "gpt-5-mini"
-    classify_excerpt_pages: int = 3
 
 
 @dataclass
 class NLMConfig:
-    poll_interval_seconds: int = 30
-    poll_max_wait_seconds: int = 1800
+    verify_interval_seconds: int = 30
     backoff_base_seconds: int = 30
     backoff_multiplier: int = 2
-    max_retries: int = 3
+    max_retries: int = 5
     request_interval_range: list[float] = field(default_factory=lambda: [0.5, 1.5])
 
 
@@ -95,9 +93,7 @@ class NLMConfig:
 class AppConfig:
     inbox: str = ""
     library: str = ""
-    database: str = ""
-    git_remote: str = ""
-    auto_push: bool = False
+    metadata: str = ""
     bucket_capacity: int = 25
     artifacts: list[str] = field(default_factory=lambda: list(DEFAULT_ARTIFACTS))
     note_prompt: str = DEFAULT_NOTE_PROMPT
@@ -111,9 +107,7 @@ class AppConfig:
         return cls(
             inbox=str(payload.get("inbox", "")),
             library=str(payload.get("library", "")),
-            database=str(payload.get("database", "")),
-            git_remote=str(payload.get("git_remote", "")),
-            auto_push=bool(payload.get("auto_push", False)),
+            metadata=str(payload.get("metadata") or payload.get("database", "")),
             bucket_capacity=int(payload.get("bucket_capacity", 25)),
             artifacts=[normalize_artifact_type(x) for x in (payload.get("artifacts") or DEFAULT_ARTIFACTS)],
             note_prompt=str(payload.get("note_prompt") or DEFAULT_NOTE_PROMPT),
@@ -128,15 +122,15 @@ class AppConfig:
         return data
 
     def resolved_paths(self) -> dict[str, Path]:
-        if not self.inbox or not self.library or not self.database:
+        if not self.inbox or not self.library or not self.metadata:
             raise ValueError(
-                "inbox, library, and database paths must all be set. "
+                "inbox, library, and metadata paths must all be set. "
                 "Run `learning-buddy config set <key> <value>`."
             )
         return {
             "inbox": Path(self.inbox).expanduser(),
             "library": Path(self.library).expanduser(),
-            "database": Path(self.database).expanduser(),
+            "metadata": Path(self.metadata).expanduser(),
         }
 
 
@@ -166,20 +160,18 @@ _NESTED_KEYS = {
     "split.min_pages_to_split": ("split", "min_pages_to_split", int),
     "split.max_pages_per_chunk": ("split", "max_pages_per_chunk", int),
     "llm.model": ("llm", "model", str),
-    "llm.classify_excerpt_pages": ("llm", "classify_excerpt_pages", int),
-    "nlm.poll_interval_seconds": ("nlm", "poll_interval_seconds", int),
-    "nlm.poll_max_wait_seconds": ("nlm", "poll_max_wait_seconds", int),
-    "nlm.backoff_base_seconds": ("nlm", "backoff_base_seconds", int),
+    "nlm.verify_interval_seconds": ("nlm", "verify_interval_seconds", int),
     "nlm.max_retries": ("nlm", "max_retries", int),
 }
 
 
 def apply_kv_update(config: AppConfig, key: str, value: str) -> None:
-    if key in {"inbox", "library", "database", "git_remote", "note_prompt"}:
+    if key in {"inbox", "library", "metadata", "note_prompt"}:
         setattr(config, key, value)
         return
-    if key == "auto_push":
-        setattr(config, key, value.lower() in {"1", "true", "yes", "y"})
+    if key == "database":
+        # legacy alias from earlier design — treat as `metadata`
+        config.metadata = value
         return
     if key == "bucket_capacity":
         config.bucket_capacity = int(value)
