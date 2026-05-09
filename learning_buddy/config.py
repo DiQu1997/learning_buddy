@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+from typing import Any
 
 
 DEFAULT_NOTE_PROMPT = """你将把一篇文章重写成"阅读版本" ，输出简体中文和英文两个版本，按内容主题分成若干小节；目标是让读者通过阅读就能完整理解文章讲了什么，就好像是在读一篇 Blog 版的文章一样。
@@ -49,6 +50,14 @@ ALL_ARTIFACT_TYPES = (
 
 
 DEFAULT_ARTIFACTS = ["note", "slide_deck", "video", "audio", "mind_map"]
+
+
+def _filter_known(cls: type, payload: dict[str, Any] | None) -> dict[str, Any]:
+    """Drop any keys not declared on the dataclass — lets us load legacy configs cleanly."""
+    if not payload:
+        return {}
+    allowed = {f.name for f in fields(cls)}
+    return {k: v for k, v in payload.items() if k in allowed}
 
 
 def normalize_artifact_type(value: str) -> str:
@@ -111,9 +120,9 @@ class AppConfig:
             bucket_capacity=int(payload.get("bucket_capacity", 25)),
             artifacts=[normalize_artifact_type(x) for x in (payload.get("artifacts") or DEFAULT_ARTIFACTS)],
             note_prompt=str(payload.get("note_prompt") or DEFAULT_NOTE_PROMPT),
-            split=SplitConfig(**(payload.get("split") or {})),
-            llm=LLMConfig(**(payload.get("llm") or {})),
-            nlm=NLMConfig(**(payload.get("nlm") or {})),
+            split=SplitConfig(**_filter_known(SplitConfig, payload.get("split"))),
+            llm=LLMConfig(**_filter_known(LLMConfig, payload.get("llm"))),
+            nlm=NLMConfig(**_filter_known(NLMConfig, payload.get("nlm"))),
         )
 
     def to_dict(self) -> dict:
