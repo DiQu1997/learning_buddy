@@ -58,8 +58,9 @@ learning-buddy run
 ```
 
 That's it. The agent will:
-1. Walk `inbox/`, fingerprint + classify each new file via OpenAI, dedup against the catalog, move accepted files into `library/`, and add a row to `catalog.json`.
-2. For each unfinished resource: split if needed (book ≥ `min_pages_to_split` pages), upload chunks to NotebookLM, kick off artifact generation (note / slide_deck / video / audio / mind_map), and verify any tasks already in flight.
+1. **Verify NotebookLM auth** (`nlm login --check`). If expired and you're at a terminal, it spawns `nlm login` for you to complete, then re-checks. Under cron / launchd (no TTY) it prints a clear error and exits non-zero — log in manually before the next run.
+2. Walk `inbox/`, fingerprint + classify each new file via OpenAI, dedup against the catalog, move accepted files into `library/`, and add a row to `catalog.json`.
+3. For each unfinished resource: split if needed (book ≥ `min_pages_to_split` pages), upload chunks to NotebookLM, kick off artifact generation (note / slide_deck / video / audio / mind_map), and verify any tasks already in flight.
 
 Each task gets advanced **at most one step per run**. Slow NotebookLM artifacts (video, slides) stay `PROCESSING` across many runs without burning the retry budget. After 5 NLM-reported failures a task moves to `FAILED`.
 

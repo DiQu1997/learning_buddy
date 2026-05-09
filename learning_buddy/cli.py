@@ -12,6 +12,7 @@ import argparse
 import fcntl
 import json
 import os
+import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -107,6 +108,11 @@ def main(argv: list[str] | None = None) -> int:
 def _cmd_run(_args: argparse.Namespace) -> int:
     config = load_config()
     paths = config.resolved_paths()
+
+    auth_rc = _ensure_nlm_auth()
+    if auth_rc != 0:
+        return auth_rc
+
     try:
         with acquire_run_lock(paths["metadata"]):
             agent = Agent(config)
@@ -116,6 +122,42 @@ def _cmd_run(_args: argparse.Namespace) -> int:
     except LockBusy as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
+
+def _ensure_nlm_auth() -> int:
+    """
+    Check NotebookLM authentication via `nlm login --check`. If expired:
+    - interactive terminal: spawn `nlm login` for the user to complete, then re-check
+    - non-interactive (cron/launchd): print a clear error and return a non-zero code
+    Returns 0 on success, non-zero on failure.
+    """
+    if _nlm_check_ok():
+        return 0
+
+    if not sys.stdin.isatty():
+        print(
+            "NLM authentication failed and no terminal is attached for interactive `nlm login`.\n"
+            "Run `nlm login` manually, then re-run `learning-buddy run`.",
+            file=sys.stderr,
+        )
+        return 3
+
+    print("NLM authentication failed. Launching `nlm login` interactively...", file=sys.stderr)
+    login = subprocess.run(["nlm", "login"])
+    if login.returncode != 0:
+        print(f"`nlm login` exited {login.returncode}; aborting.", file=sys.stderr)
+        return 3
+
+    if not _nlm_check_ok():
+        print("Still not authenticated after `nlm login`; aborting.", file=sys.stderr)
+        return 3
+
+    return 0
+
+
+def _nlm_check_ok() -> bool:
+    proc = subprocess.run(["nlm", "login", "--check"], capture_output=True, text=True)
+    return proc.returncode == 0
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
