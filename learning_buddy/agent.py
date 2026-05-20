@@ -38,6 +38,12 @@ INBOX_LOG_FILE = "_log.txt"
 _NLM_DONE_STATES = {"completed", "ready", "succeeded", "success", "done"}
 _NLM_FAILED_STATES = {"failed", "error", "errored"}
 
+# When verify can't find our stored artifact_id in NLM's studio_status, we wait
+# this many consecutive misses before escalating to a re-create retry. Guards
+# against NLM eventual-consistency / indexing delay producing duplicate
+# artifacts on the very first missing verify.
+_MISSING_VERIFY_THRESHOLD = 3
+
 
 # ---------------------------------------------------------------------------
 # Run summary
@@ -414,15 +420,21 @@ class Agent:
 
         live = next((s for s in statuses if s.artifact_id == nlm_artifact_id), None)
         if live is None:
-            # We have an artifact_id but NLM doesn't know about it. Could be a
-            # transient indexing delay, or NLM truly lost / the user deleted it.
-            # Either way, the right move is to use the retry budget — re-create
-            # the artifact and update our id. If NLM is just slow, this risks one
-            # duplicate artifact; if NLM actually lost it, this is the recovery.
+            # NLM doesn't return our artifact_id. Could be a transient indexing
+            # delay, or NLM truly lost it / the user deleted it. Bump a soft
+            # counter; only escalate to a re-create retry after several
+            # consecutive misses, so a once-off slow index doesn't produce a
+            # duplicate artifact.
+            missing = int(task.get("missing_verify_count") or 0) + 1
+            task["missing_verify_count"] = missing
+            if missing < _MISSING_VERIFY_THRESHOLD:
+                return
+            # Persistent miss — recover via the same retry path as NLM-reported-failed.
+            task["missing_verify_count"] = 0
             self._fail_task_attempt(
                 task,
                 summary,
-                f"artifact_id {nlm_artifact_id} not found in studio status",
+                f"artifact_id {nlm_artifact_id} not found after {missing} verify attempts",
                 retry_action=lambda: self.nlm.create_artifact(
                     notebook_id,
                     task["type"],
@@ -433,6 +445,10 @@ class Agent:
                 on_retry_artifact_id=lambda new_id: task.update({"nlm_artifact_id": new_id}),
             )
             return
+
+        # Artifact found — reset the soft counter regardless of its state.
+        if task.get("missing_verify_count"):
+            task["missing_verify_count"] = 0
 
         live_state = (live.status or "").lower()
         if live_state in _NLM_DONE_STATES:
