@@ -414,7 +414,24 @@ class Agent:
 
         live = next((s for s in statuses if s.artifact_id == nlm_artifact_id), None)
         if live is None:
-            # Still scheduling on NLM's side — leave PROCESSING, no counter change.
+            # We have an artifact_id but NLM doesn't know about it. Could be a
+            # transient indexing delay, or NLM truly lost / the user deleted it.
+            # Either way, the right move is to use the retry budget — re-create
+            # the artifact and update our id. If NLM is just slow, this risks one
+            # duplicate artifact; if NLM actually lost it, this is the recovery.
+            self._fail_task_attempt(
+                task,
+                summary,
+                f"artifact_id {nlm_artifact_id} not found in studio status",
+                retry_action=lambda: self.nlm.create_artifact(
+                    notebook_id,
+                    task["type"],
+                    source_id,
+                    report_format="Study Guide",
+                    note_prompt=self.config.note_prompt,
+                ),
+                on_retry_artifact_id=lambda new_id: task.update({"nlm_artifact_id": new_id}),
+            )
             return
 
         live_state = (live.status or "").lower()
