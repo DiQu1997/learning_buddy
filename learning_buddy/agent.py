@@ -378,7 +378,10 @@ class Agent:
             # Upload not done yet — should not happen; defensive no-op.
             return
 
-        if state == cat.NOT_STARTED:
+        # Kick-off path: either a fresh task, OR a PROCESSING task whose previous
+        # kick-off didn't yield an artifact_id (so we have nothing to verify).
+        # Subject to retry_count — if max_retries reached, _fail_task_attempt marks FAILED.
+        if state == cat.NOT_STARTED or not task.get("nlm_artifact_id"):
             try:
                 artifact_id = self.nlm.create_artifact(
                     notebook_id,
@@ -393,6 +396,7 @@ class Agent:
                 return
             if artifact_id:
                 task["nlm_artifact_id"] = artifact_id
+                task["last_error"] = None
                 self._set_task_state(task, cat.PROCESSING)
                 summary.tasks_kicked_off += 1
             else:
@@ -400,8 +404,8 @@ class Agent:
                 self._fail_task_attempt(task, summary, "no artifact id returned")
             return
 
-        # state == PROCESSING — verify, then either retry once or wait.
-        nlm_artifact_id = task.get("nlm_artifact_id")
+        # state == PROCESSING with nlm_artifact_id — verify, then either retry once or wait.
+        nlm_artifact_id = task["nlm_artifact_id"]
         try:
             statuses = self.nlm.list_studio_status(notebook_id)
         except NLMError as exc:
