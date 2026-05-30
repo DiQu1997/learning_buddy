@@ -4,4 +4,8 @@ __pycache__/
 .venv/
 output/
 .learning_buddy/
+.claude/
+*.egg-info/
+lb_review_*.html
+lb_review_*.json
 
