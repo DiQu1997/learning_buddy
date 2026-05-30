@@ -206,26 +206,36 @@ task.state      : NOT_STARTED | PROCESSING | DONE | FAILED
 
 ## 4. Schema organization inside gitkv — full paths
 
-Single table, prefix **`learning_buddy`**. Two key namespaces:
+Single table, prefix **`learning_buddy`**. **Recommended layout: one directory
+per knowledge file.** Because gitkv keys map verbatim to git tree paths, a `/`
+in a key *is* a directory — so every original file gets its own directory under
+`resources/<id>/`, with its metadata split into a few small blobs:
 
-| record | gitkv key | git tree path (on `learning_buddy_log_<hex>`) | written by |
-|---|---|---|---|
-| catalog index | `catalog` | `catalog` | `Catalog.save()` |
-| resource queue | `resources/<id>` | `resources/<id>` | `ResourceFile.save()` |
+| blob (gitkv key = git tree path) | holds | written by |
+|---|---|---|
+| `resources/<id>/meta` | the `CatalogEntry` fields (index: sha256, title, authors, kind, category, library_path, toc, page_count, overall_status, timestamps) | Phase A intake; status rollup |
+| `resources/<id>/queue` | `notebook_id` + `sources[]` + their `tasks[]` (the task state machine) | Phase B drain |
 
 Concrete example — a single book with id `f_a1b2c3d4`:
 
 ```
 kv_repo (e.g. ~/learning_buddy_kv, origin → github.com/<you>/<kv-repo>)
 └── branch: learning_buddy_log_9f3c1a77b0e2d4a6   (active log)
-    ├── catalog                                   ← JSON: full CatalogEntry index
     └── resources/
-        └── f_a1b2c3d4                            ← JSON: notebook_id + sources[] + tasks[]
+        └── f_a1b2c3d4/              ← one directory per original knowledge file
+            ├── meta                 ← JSON: CatalogEntry (index fields + overall_status)
+            └── queue                ← JSON: notebook_id + sources[] + tasks[]
 
 (registry) branch: main
 └── tables/
-    └── learning_buddy                            ← empty blob, registers the table
+    └── learning_buddy               ← empty blob, registers the table
 ```
+
+This keeps everything about one file in one place (easy to browse in the repo,
+delete by prefix, and diff), and lets Phase A (index fields) and the hot-path
+task updates (`queue`) commit independently without rewriting each other. Room
+to add more per-file blobs later (e.g. `resources/<id>/log`) without schema
+churn.
 
 Read/write addressing in code:
 
@@ -233,44 +243,64 @@ Read/write addressing in code:
 db   = gitkv.open(cfg.kv_repo)            # resolves the clone + remote
 tbl  = db["learning_buddy"]
 
-# catalog
-tbl["catalog"]                           = json.dumps(catalog_dict)
-catalog_dict = json.loads(tbl["catalog"])
+# index fields for one resource
+tbl[f"resources/{rid}/meta"]   = json.dumps(meta_dict)
+meta = json.loads(tbl[f"resources/{rid}/meta"])
 
-# one resource
-tbl[f"resources/{rid}"]                  = json.dumps(resource_dict)
-resource_dict = json.loads(tbl[f"resources/{rid}"])
+# task queue for one resource
+tbl[f"resources/{rid}/queue"]  = json.dumps(queue_dict)
+queue = json.loads(tbl[f"resources/{rid}/queue"])
 
-# enumerate all resources (Option B / recovery)
-for key, value in tbl.list_items("resources/"):
-    rec = json.loads(value)
+# build the in-memory index across all resources
+metas = [json.loads(v) for k, v in tbl.list_items("resources/") if k.endswith("/meta")]
+metas.sort(key=lambda m: m["created_at"])     # see §4.1 — ordering
 ```
 
 Every assignment above is one commit on `learning_buddy_log_<hex>` and an
 auto-push to `origin`. History (`git log` of that branch) is the audit trail.
 
+### 4.1 Ordering
+
+`gitkv.list_keys()` / `list_items()` return keys in **lexicographic** order. Our
+ids are `"f_" + random hex`, so a raw listing is stable but **not** in creation
+order. The catalog is therefore *unordered at the key level*; impose order
+explicitly:
+
+- **Sort in-memory after listing (recommended).** Each `meta` blob carries
+  `created_at` (and `title`, `overall_status`), so we sort the loaded list by
+  whatever the caller needs — creation time, title, status. No extra reads (we
+  already fetched the blobs). This is what every existing query method wants
+  anyway (`list_unfinished` filters, `existing_summary` order is cosmetic).
+- **Sortable keys (only if tree-order itself must be meaningful).** Prefix the
+  key with a zero-padded counter or timestamp, e.g.
+  `resources/00042__f_a1b2c3d4/meta`, so `list_keys` returns creation order
+  directly. Costs a secondary index for id/sha lookups, so not worth it here.
+
+For the `sources[]` *within* a resource, order is meaningful (chapter 1, 2, …)
+and is preserved by the JSON array inside the single `queue` blob — no key-level
+sorting needed. (If sources were ever promoted to their own blobs, name them
+`sources/01`, `sources/02`, … zero-padded so `list_keys` stays in order.)
+
 ---
 
-## 5. Two layout options
+## 5. Layout alternatives considered
 
-Both use the table/key scheme above; they differ only in whether the `catalog`
-key exists as a stored document.
+The per-file-directory layout (§4) is the recommendation. Two simpler variants
+were considered:
 
-- **Option A — monolithic `catalog` doc (recommended to start).** Keep
-  `catalog` as a single stored value. One read loads the whole index; all
-  existing query methods (`find_by_sha`, `find_by_id`, `list_unfinished`,
-  `categories_in_use`, `existing_summary`, `counts`) run in-memory, unchanged.
-  Smallest diff.
+- **Single blob per resource** — `resources/<id>` holding meta+queue together
+  (one JSON doc). Fewer keys, but every task-state update rewrites the index
+  fields too, and the two phases can't commit independently. Fine if we want the
+  smallest possible diff.
+- **Monolithic `catalog` doc** — one `catalog` key holding the whole index array
+  (closest to today's `catalog.json`). Preserves array insertion order for free
+  and gives an atomic index snapshot, but serializes all writers onto one blob
+  (cross-machine contention) and grows unboundedly. Acceptable only for a
+  single-machine setup.
 
-- **Option B — derive the index from `resources/*`.** Drop the stored `catalog`
-  key; rebuild the in-memory index each run via `tbl.list_items("resources/")`.
-  More git-native (two machines writing different resources never contend on a
-  shared `catalog` blob), at the cost of N reads per run. Enabled by the new
-  iteration API.
-
-Recommendation: ship **A**, keep **B** as a clean follow-up. Regardless of
-choice, `tbl.list_keys("resources/")` gives a free "rebuild `catalog` from
-resources" recovery/repair path.
+Recommendation: **per-file directory (§4)** for the git-native grouping and
+independent commits the goals call for. `tbl.list_keys("resources/")` also gives
+a free "rebuild the index from the per-file blobs" recovery/repair path.
 
 ---
 
@@ -285,11 +315,14 @@ resources" recovery/repair path.
    `write(key, text)`, `delete(key)`. Centralizes the table name and key scheme.
 
 3. **`learning_buddy/catalog.py`** *(reworked; dataclasses + all query/mutation
-   logic unchanged)* — replace the three filesystem ops with store calls:
+   logic unchanged)* — replace the three filesystem ops with store calls and
+   adopt the per-file key scheme:
    - `_atomic_write(path, text)`            → `store.write(key, text)`
    - `path.read_text()` / `path.exists()`   → `store.read(key)` (`None` = missing)
-   - `Catalog.load/save`, `ResourceFile.load/save/create/exists` switch from
-     `metadata_dir` paths to gitkv keys (`catalog`, `resources/<id>`).
+   - `Catalog` becomes a derived index: `load()` does
+     `store.list_items("resources/")`, keeps `*/meta` blobs, sorts by
+     `created_at` (§4.1); per-entry writes go to `resources/<id>/meta`.
+   - `ResourceFile.load/save/create/exists` map to `resources/<id>/queue`.
 
 4. **`learning_buddy/config.py`** — replace the `metadata` path with `kv_repo`
    (path to the local clone, which must have `origin` set) and an optional
@@ -334,4 +367,7 @@ resources" recovery/repair path.
    keep initially).
 3. `learning-buddy migrate` as a one-shot, or auto-import on first run when
    gitkv is empty but an old `metadata` dir exists.
-4. Layout Option A vs B (recommendation: A first).
+4. Layout: per-file directory `resources/<id>/{meta,queue}` (§4, recommended)
+   vs the single-blob or monolithic-`catalog` variants (§5).
+5. Ordering: in-memory sort by `created_at` (§4.1, recommended) vs sortable
+   keys.
