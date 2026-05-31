@@ -27,6 +27,7 @@ from .chunking import (
 from .classify import ClassificationResult, classify_file, compute_fingerprint
 from .config import AppConfig
 from .nlm_client import NLMAuthError, NLMCLI, NLMError
+from .store import Store
 from .utils import utc_now_iso
 
 
@@ -97,13 +98,14 @@ class Agent:
         *,
         logger: Logger | None = None,
         nlm_client: NLMCLI | None = None,
+        store: Store | None = None,
     ):
         self.config = config
         self.logger = logger or _default_logger
         paths = config.resolved_paths()
         self.inbox = paths["inbox"]
         self.library = paths["library"]
-        self.metadata = paths["metadata"]
+        self.store = store or Store.open(config.kv_repo(), config.kv.table)
         self.nlm = nlm_client or NLMCLI(
             backoff_base_seconds=config.nlm.backoff_base_seconds,
             backoff_multiplier=config.nlm.backoff_multiplier,
@@ -116,8 +118,7 @@ class Agent:
 
     def run(self) -> RunSummary:
         summary = RunSummary()
-        self.metadata.mkdir(parents=True, exist_ok=True)
-        catalog = Catalog.load(self.metadata)
+        catalog = Catalog.load(self.store)
 
         try:
             self._phase_a_intake(catalog, summary)
@@ -127,7 +128,6 @@ class Agent:
             summary.auth_aborted = True
             summary.notes.append(f"NLM auth error: {exc}")
 
-        catalog.save()
         return summary
 
     # ---- Phase A: inbox → catalog -----------------------------------------
@@ -194,7 +194,6 @@ class Agent:
             toc=result.toc,
             page_count=fingerprint.page_count,
         )
-        catalog.save()
         summary.discovered += 1
         self._append_inbox_log(
             f"{path.name}: classified as {result.kind} → {'/'.join(result.category)} "
@@ -212,16 +211,16 @@ class Agent:
             except Exception as exc:
                 self.logger(f"[{entry['id']}] drain error: {exc}")
                 summary.notes.append(f"{entry['id']} drain error: {exc}")
-            catalog.save()
 
     def _advance_resource(self, catalog: Catalog, entry: dict[str, Any], summary: RunSummary) -> None:
         # 1. Ensure the resource file exists. Create on first encounter (split if needed).
-        if not ResourceFile.exists(self.metadata, entry["id"]):
+        if not ResourceFile.exists(self.store, entry["id"]):
             rf = self._create_resource_file(entry)
             summary.resource_files_created += 1
+            # Persists the entry too — including any library_path rewritten by the split.
             catalog.set_overall_status(entry, cat.IN_PROGRESS)
         else:
-            rf = ResourceFile.load(self.metadata, entry["id"])
+            rf = ResourceFile.load(self.store, entry["id"])
             if entry["overall_status"] == cat.NEW:
                 catalog.set_overall_status(entry, cat.IN_PROGRESS)
 
@@ -320,7 +319,7 @@ class Agent:
             ]
 
         return ResourceFile.create(
-            self.metadata,
+            self.store,
             entry["id"],
             notebook_id=None,
             sources=sources,
@@ -515,7 +514,7 @@ class Agent:
     def _ensure_notebook(self, rf: ResourceFile) -> str:
         if rf.notebook_id:
             return rf.notebook_id
-        entry = Catalog.load(self.metadata).find_by_id(rf.resource_id)
+        entry = Catalog.load(self.store).find_by_id(rf.resource_id)
         if entry is None:
             raise RuntimeError(f"catalog entry missing for {rf.resource_id}")
         kind = entry.get("kind") or "other"
