@@ -202,6 +202,95 @@ task.state      : NOT_STARTED | PROCESSING | DONE | FAILED
   artifact stays `PROCESSING` with the counter unchanged. At `5` → `FAILED`.
 - `DONE` and `FAILED` are terminal.
 
+### 3.5 Formal JSON Schemas
+
+The two blobs stored per resource (§4), as JSON Schema (draft 2020-12).
+
+**`resources/<id>/meta`**
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LearningBuddyResourceMeta",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "sha256", "title", "authors", "kind", "category",
+               "library_path", "toc", "page_count", "overall_status",
+               "created_at", "updated_at"],
+  "properties": {
+    "id":            { "type": "string", "pattern": "^f_[0-9a-f]{10}$" },
+    "sha256":        { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "title":         { "type": "string", "minLength": 1 },
+    "authors":       { "type": "array", "items": { "type": "string" } },
+    "kind":          { "enum": ["book","paper","blog","slides","note",
+                                "article","transcript","other"] },
+    "category":      { "type": "array", "items": { "type": "string" },
+                       "minItems": 1 },
+    "library_path":  { "type": "string", "minLength": 1 },
+    "toc":           { "type": "array", "items": { "type": "string" } },
+    "page_count":    { "type": "integer", "minimum": 0 },
+    "overall_status":{ "enum": ["NEW","IN_PROGRESS","DONE","FAILED"] },
+    "created_at":    { "type": "string", "format": "date-time" },
+    "updated_at":    { "type": "string", "format": "date-time" }
+  }
+}
+```
+
+**`resources/<id>/queue`**
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LearningBuddyResourceQueue",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["resource_id", "notebook_id", "created_at", "updated_at", "sources"],
+  "properties": {
+    "resource_id": { "type": "string", "pattern": "^f_[0-9a-f]{10}$" },
+    "notebook_id": { "type": ["string", "null"] },
+    "created_at":  { "type": "string", "format": "date-time" },
+    "updated_at":  { "type": "string", "format": "date-time" },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["idx", "title", "library_path", "page_range",
+                     "nlm_source_id", "tasks"],
+        "properties": {
+          "idx":           { "type": "integer", "minimum": 1 },
+          "title":         { "type": "string" },
+          "library_path":  { "type": "string" },
+          "page_range":    { "oneOf": [
+                               { "type": "array", "items": {"type":"integer"},
+                                 "minItems": 2, "maxItems": 2 },
+                               { "type": "string" },
+                               { "type": "null" } ] },
+          "nlm_source_id": { "type": ["string", "null"] },
+          "tasks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["type", "state", "retry_count", "last_error"],
+              "properties": {
+                "type":            { "enum": ["upload","note","slide_deck",
+                                              "video","audio","mind_map"] },
+                "state":           { "enum": ["NOT_STARTED","PROCESSING",
+                                              "DONE","FAILED"] },
+                "retry_count":     { "type": "integer", "minimum": 0, "maximum": 5 },
+                "last_error":      { "type": ["string", "null"] },
+                "nlm_artifact_id": { "type": "string" },
+                "url":             { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
 ---
 
 ## 4. Schema organization inside gitkv — full paths
@@ -348,11 +437,12 @@ a free "rebuild the index from the per-file blobs" recovery/repair path.
 
 **Tradeoffs**
 
-- **Commit volume:** each `save()` is a commit + push, so a `run` advancing N
-  tasks produces N commits. This is gitkv's model and gives the audit trail we
-  want; it is chattier than today's single JSON write. Per-write commits are
-  kept deliberately so a mid-run crash stays recoverable. Batching (write once
-  at end of run) is a possible later optimization.
+- **Commit volume:** each `save()` is a commit + push. We save **per resource
+  per run**, not per task (matching today's code — Phase B advances all of a
+  resource's tasks, then writes its `queue` once), so a run produces roughly
+  `(#new inbox files) + (#active resources)×(1 queue + ≤1 meta)` commits, **not**
+  one per task. See §13 for the full cost breakdown. Still chattier than today's
+  single JSON write, which is the price of the audit trail.
 - **Network on the hot path:** auto-push means a `run` needs the remote
   reachable. A non-fast-forward push retries via CAS; worst case a run errors and
   is simply re-run.
@@ -371,3 +461,325 @@ a free "rebuild the index from the per-file blobs" recovery/repair path.
    vs the single-blob or monolithic-`catalog` variants (§5).
 5. Ordering: in-memory sort by `created_at` (§4.1, recommended) vs sortable
    keys.
+
+---
+
+## 8. Reference implementation sketch
+
+Illustrative, not final code. Pins gitkv `0.4.0`.
+
+### 8.1 `learning_buddy/store.py` (new)
+
+```python
+"""Git-backed metadata store (gitkv). One table; keys map verbatim to git paths."""
+import gitkv
+
+TABLE = "learning_buddy"
+RESOURCE_PREFIX = "resources/"
+
+
+def meta_key(rid: str) -> str:
+    return f"{RESOURCE_PREFIX}{rid}/meta"
+
+
+def queue_key(rid: str) -> str:
+    return f"{RESOURCE_PREFIX}{rid}/queue"
+
+
+class Store:
+    def __init__(self, table):
+        self._tbl = table
+
+    @classmethod
+    def open(cls, kv_repo: str) -> "Store":
+        db = gitkv.open(str(kv_repo))          # arg → GITKV_REPO → config cascade
+        if TABLE not in db:
+            db.create_table(TABLE)             # idempotent
+        return cls(db[TABLE])
+
+    def read(self, key: str) -> str | None:
+        return self._tbl.get(key)              # explicit get → None on miss
+
+    def write(self, key: str, text: str) -> None:
+        if self._tbl.get(key) == text:         # idempotent: skip no-op commits
+            return
+        self._tbl[key] = text                  # one commit on the log branch (+ push)
+
+    def delete(self, key: str) -> None:
+        try:
+            del self._tbl[key]
+        except KeyError:
+            pass
+
+    def list_meta(self) -> list[str]:
+        # blobs only; tree-cheap key scan then read each
+        return [k for k in self._tbl.list_keys(RESOURCE_PREFIX) if k.endswith("/meta")]
+
+    def iter_meta(self):
+        for k, v in self._tbl.list_items(RESOURCE_PREFIX):
+            if k.endswith("/meta"):
+                yield v
+```
+
+### 8.2 `learning_buddy/catalog.py` (reworked)
+
+The dataclasses and **every query/mutation method keep their signatures**; only
+load/save/persistence change. `Catalog` becomes a *derived* index (no stored
+`catalog` blob): mutations write the affected `meta` blob immediately, so the
+end-of-run `catalog.save()` disappears.
+
+```python
+@dataclass
+class Catalog:
+    store: Store
+    _by_id: dict[str, dict]          # rid -> meta dict (in-memory)
+
+    @classmethod
+    def load(cls, store: Store) -> "Catalog":
+        by_id = {}
+        for text in store.iter_meta():
+            m = json.loads(text)
+            by_id[m["id"]] = m
+        return cls(store=store, _by_id=by_id)
+
+    @property
+    def resources(self) -> list[dict]:
+        return sorted(self._by_id.values(), key=lambda m: m["created_at"])  # §4.1
+
+    # queries (find_by_sha / find_by_id / list_unfinished / categories_in_use /
+    # existing_summary / counts) are UNCHANGED — they iterate self.resources.
+
+    def add_resource(self, **fields) -> dict:
+        entry = {... , "id": new_resource_id(), "overall_status": NEW,
+                 "created_at": now, "updated_at": now}
+        self._by_id[entry["id"]] = entry
+        self.store.write(meta_key(entry["id"]), _dump_json(entry))   # commit now
+        return entry
+
+    def set_overall_status(self, entry: dict, status: str) -> None:
+        entry["overall_status"] = status
+        entry["updated_at"] = utc_now_iso()
+        self.store.write(meta_key(entry["id"]), _dump_json(entry))   # commit now
+
+
+@dataclass
+class ResourceFile:
+    store: Store
+    resource_id: str
+    data: dict
+
+    @classmethod
+    def exists(cls, store, rid) -> bool:
+        return store.read(queue_key(rid)) is not None
+
+    @classmethod
+    def load(cls, store, rid) -> "ResourceFile":
+        text = store.read(queue_key(rid))
+        if text is None:
+            raise FileNotFoundError(rid)
+        return cls(store, rid, json.loads(text))
+
+    @classmethod
+    def create(cls, store, rid, *, notebook_id, sources) -> "ResourceFile":
+        rf = cls(store, rid, {"resource_id": rid, "notebook_id": notebook_id,
+                              "created_at": utc_now_iso(), "updated_at": utc_now_iso(),
+                              "sources": sources})
+        rf.save()
+        return rf
+
+    def save(self) -> None:                       # called once per resource per run
+        self.data["updated_at"] = utc_now_iso()
+        self.store.write(queue_key(self.resource_id), _dump_json(self.data))
+```
+
+### 8.3 `agent.py` / `cli.py` deltas
+
+- `cli.py`: `store = Store.open(cfg.kv.repo)` once per `run`, under the existing
+  `fcntl` lock; pass `store` into `Catalog.load(store)`.
+- `agent.py`: drop the final `catalog.save()` (mutations self-persist).
+  `ResourceFile.save()` is still called once after a resource's tasks are
+  advanced — unchanged cadence, just a gitkv write instead of a file write.
+
+---
+
+## 9. Worked example — one book, commit by commit
+
+Book "Deep Learning", id `f_a1b2c3d4ef`, split into 3 chapters × 6 tasks.
+
+**Run 1 — Phase A (intake)** writes one blob:
+
+`resources/f_a1b2c3d4ef/meta`
+```json
+{
+  "id": "f_a1b2c3d4ef", "sha256": "9c1f…",
+  "title": "Deep Learning", "authors": ["Goodfellow","Bengio","Courville"],
+  "kind": "book", "category": ["CS","AI","DL","books"],
+  "library_path": "CS/AI/DL/books/Deep Learning.pdf",
+  "toc": ["Ch 1 Introduction","Ch 2 Linear Algebra", "…"],
+  "page_count": 802, "overall_status": "NEW",
+  "created_at": "2026-05-31T10:00:00Z", "updated_at": "2026-05-31T10:00:00Z"
+}
+```
+→ commit `Set key: resources/f_a1b2c3d4ef/meta`
+
+**Run 1 — Phase B (drain)** creates the queue, flips status, advances tasks:
+
+`resources/f_a1b2c3d4ef/queue` (abridged — 3 sources shown as 1)
+```json
+{
+  "resource_id": "f_a1b2c3d4ef", "notebook_id": "nb_deeplearning",
+  "created_at": "2026-05-31T10:00:05Z", "updated_at": "2026-05-31T10:00:09Z",
+  "sources": [
+    { "idx": 1, "title": "Chapter 1 Introduction",
+      "library_path": "CS/AI/DL/books/Deep Learning/01_introduction.pdf",
+      "page_range": [1, 24], "nlm_source_id": "src_001",
+      "tasks": [
+        {"type":"upload",    "state":"DONE","retry_count":0,"last_error":null},
+        {"type":"note",      "state":"PROCESSING","retry_count":0,"last_error":null,"nlm_artifact_id":"art_n1"},
+        {"type":"slide_deck","state":"PROCESSING","retry_count":0,"last_error":null,"nlm_artifact_id":"art_s1"},
+        {"type":"video",     "state":"PROCESSING","retry_count":0,"last_error":null,"nlm_artifact_id":"art_v1"},
+        {"type":"audio",     "state":"PROCESSING","retry_count":0,"last_error":null,"nlm_artifact_id":"art_a1"},
+        {"type":"mind_map",  "state":"PROCESSING","retry_count":0,"last_error":null,"nlm_artifact_id":"art_m1"}
+      ] }
+  ]
+}
+```
+→ commit `Set key: resources/f_a1b2c3d4ef/queue` (create + advance saved once)
+→ commit `Set key: resources/f_a1b2c3d4ef/meta` (overall_status NEW → IN_PROGRESS)
+
+Run-1 commit count for this book: **3** (1 intake meta + 1 queue + 1 status meta).
+
+**Run 2..N (cron):** Phase A no-op; Phase B re-verifies PROCESSING tasks, writes
+`queue` once if anything changed. A still-rendering video → no change → **0
+commits** that run (the `Store.write` no-op guard skips identical content).
+
+**Run F (final):** last task flips to DONE → `queue` write (1) + `meta`
+status IN_PROGRESS → DONE (1) = **2 commits**. Subsequent runs skip the entry
+entirely (`overall_status == DONE` not in `UNFINISHED`).
+
+The book's entire history is `git log -- resources/f_a1b2c3d4ef/` on the active
+log branch.
+
+---
+
+## 10. Config — before / after
+
+**Today** (`~/.config/learning-buddy/config.json`):
+
+```json
+{ "inbox": "…", "library": "…", "metadata": "/Users/qudi/knowledge_metadata",
+  "split": {"min_pages_to_split":35,"max_pages_per_chunk":25},
+  "bucket_capacity": 25, "artifacts": ["note","slide_deck","video","audio","mind_map"],
+  "llm": {"model":"gpt-5-mini"}, "nlm": {"verify_interval_seconds":30,"max_retries":5} }
+```
+
+**After** — replace `metadata` with a `kv` block:
+
+```json
+{ "inbox": "…", "library": "…",
+  "kv": {
+    "repo": "~/learning_buddy_kv",   // local clone; must have `origin` configured
+    "table": "learning_buddy",        // gitkv table prefix (^[a-z0-9_]{1,63}$)
+    "auto_push": true                 // gitkv pushes every write to origin
+  },
+  "split": {"min_pages_to_split":35,"max_pages_per_chunk":25},
+  "bucket_capacity": 25, "artifacts": ["note","slide_deck","video","audio","mind_map"],
+  "llm": {"model":"gpt-5-mini"}, "nlm": {"verify_interval_seconds":30,"max_retries":5} }
+```
+
+`config.py` loads `kv.repo` (required), `kv.table` (default `learning_buddy`).
+A legacy `metadata` field is tolerated (warn + ignore) so old configs don't
+crash. The clone is a user/setup concern: `git clone <kv-remote> ~/learning_buddy_kv`.
+
+---
+
+## 11. One-time migration — `learning-buddy migrate`
+
+Imports the existing on-disk store into gitkv. Idempotent (the `Store.write`
+no-op guard means re-running adds no commits if content is unchanged).
+
+```
+learning-buddy migrate --from <old_metadata_dir>
+
+  store = Store.open(cfg.kv.repo)
+  old   = Path(--from or cfg.legacy_metadata)
+
+  # 1. catalog.json rows → per-resource meta blobs
+  for entry in json.load(old/"catalog.json")["resources"]:
+      store.write(meta_key(entry["id"]), dumps(entry))
+
+  # 2. resources/<id>.json → per-resource queue blobs
+  for f in (old/"resources").glob("*.json"):
+      store.write(queue_key(f.stem), f.read_text())
+
+  print summary: N meta, M queue written
+```
+
+Verification after migrate: `Catalog.load(store).counts()` should match the old
+`catalog.json` counts; `store.list_meta()` length == number of catalog rows.
+
+---
+
+## 12. Concurrency, CAS & multi-machine
+
+Each write commits to the active log branch and fast-forward-pushes to `origin`
+(compare-and-swap, up to `DEFAULT_MAX_CAS_ATTEMPTS = 20` retries).
+
+- **Same machine, two runs:** prevented by the existing `fcntl` lock at
+  `<state>/.learning-buddy.lock`. Keep it — it's free and avoids needless CAS
+  churn.
+- **Different machines, different resources:** machine B's push may be rejected
+  non-fast-forward; gitkv fetches, replays B's commit on the new tip, re-pushes.
+  Since the two writes touch different blob paths (`resources/<idA>/…` vs
+  `resources/<idB>/…`) there is no content conflict — this is exactly why the
+  per-file layout (§4) matters. Converges within the CAS retry budget.
+- **Different machines, same resource, same instant:** last-writer-wins at the
+  blob level after CAS replay — one machine's update to that blob can be lost.
+  This is the one genuine race. For the intended usage (single user, cron on one
+  machine, occasional manual run elsewhere) it is acceptable; if it ever matters,
+  a per-resource advisory lock blob (`resources/<id>/.lock`) could gate it.
+
+No data corruption is possible — git guarantees each commit is a consistent
+tree; the worst case is a lost *update* to one blob, never a torn write.
+
+---
+
+## 13. Cost per run (git ops)
+
+Let `A` = new inbox files this run, `R` = active (unfinished) resources,
+`Rc` = resources whose status changed this run.
+
+| operation | reads (fetch) | writes (commit + push) |
+|---|---|---|
+| load index | 1 × `list_items("resources/")` | — |
+| Phase A intake | — | `A` (one `meta` each) |
+| Phase B load queues | `R` (one `read` each) | — |
+| Phase B advance | live NLM calls (unchanged) | ≤ `R` queue + `Rc` meta |
+| **total** | `1 + R` | `A + R + Rc` (worst case) |
+
+In steady state (nothing new, things still rendering), the `Store.write` no-op
+guard drops unchanged-`queue` writes to **0 commits**. gitkv's `list_keys` is
+tree-only (no blob fetch); `list_items` fetches blobs on the active branch and
+is **partial-clone compatible**, so a large history doesn't bloat the working
+read. Log rotation only kicks in at `DEFAULT_ROTATION_THRESHOLD = 10000` commits
+per branch — years away at cron cadence.
+
+---
+
+## 14. Key & store constraints (from gitkv `_store.py`)
+
+- **Table prefix** must match `^[a-z0-9_]{1,63}$` → `learning_buddy` ✓.
+- **Key rules** (`_validate_key`): non-empty, **relative** (no leading `/`),
+  segments split on `/`; no empty segment, `.`, `..`, or `.git`. Our keys
+  `resources/f_<hex>/meta` and `…/queue` satisfy all of these.
+- **id format**: `f_` + 10 hex chars (`new_resource_id`) — safe as a path
+  segment; no escaping needed.
+- **Value type**: strings only → we `json.dumps`/`json.loads` at the boundary.
+- **Commit messages** are `Set key: <key>` / `Delete key: <key>` (+ a
+  `Commit-Number` trailer), so `git log` on the KV repo is a readable audit log
+  keyed by exactly which blob changed.
+- **Miss semantics**: `table.get(key)` → `None`; `table[key]` raises `KeyError`.
+  `Store.read` uses `.get` so "missing" is `None`, matching today's
+  `path.exists()` checks.
+- **Pin** `gitkv==0.4.0` (or `git+…@<tag>`) in `pyproject.toml` so the on-disk
+  format and API stay stable across machines sharing one KV repo.
