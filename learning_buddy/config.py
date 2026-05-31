@@ -85,6 +85,15 @@ class SplitConfig:
 
 
 @dataclass
+class KVConfig:
+    """gitkv-backed metadata store. `repo` is a local clone that must have an
+    `origin` remote configured — gitkv commits and pushes on every write."""
+
+    repo: str = ""
+    table: str = "learning_buddy"
+
+
+@dataclass
 class LLMConfig:
     model: str = "gpt-5-mini"
 
@@ -102,7 +111,7 @@ class NLMConfig:
 class AppConfig:
     inbox: str = ""
     library: str = ""
-    metadata: str = ""
+    kv: KVConfig = field(default_factory=KVConfig)
     bucket_capacity: int = 25
     artifacts: list[str] = field(default_factory=lambda: list(DEFAULT_ARTIFACTS))
     note_prompt: str = DEFAULT_NOTE_PROMPT
@@ -116,7 +125,7 @@ class AppConfig:
         return cls(
             inbox=str(payload.get("inbox", "")),
             library=str(payload.get("library", "")),
-            metadata=str(payload.get("metadata") or payload.get("database", "")),
+            kv=KVConfig(**_filter_known(KVConfig, payload.get("kv"))),
             bucket_capacity=int(payload.get("bucket_capacity", 25)),
             artifacts=[normalize_artifact_type(x) for x in (payload.get("artifacts") or DEFAULT_ARTIFACTS)],
             note_prompt=str(payload.get("note_prompt") or DEFAULT_NOTE_PROMPT),
@@ -131,16 +140,23 @@ class AppConfig:
         return data
 
     def resolved_paths(self) -> dict[str, Path]:
-        if not self.inbox or not self.library or not self.metadata:
+        if not self.inbox or not self.library:
             raise ValueError(
-                "inbox, library, and metadata paths must all be set. "
+                "inbox and library paths must both be set. "
                 "Run `learning-buddy config set <key> <value>`."
             )
         return {
             "inbox": Path(self.inbox).expanduser(),
             "library": Path(self.library).expanduser(),
-            "metadata": Path(self.metadata).expanduser(),
         }
+
+    def kv_repo(self) -> Path:
+        if not self.kv.repo:
+            raise ValueError(
+                "kv.repo must point to a gitkv clone (with an `origin` remote). "
+                "Run `learning-buddy config set kv.repo <path>`."
+            )
+        return Path(self.kv.repo).expanduser()
 
 
 def default_config_path() -> Path:
@@ -166,6 +182,8 @@ def save_config(config: AppConfig, path: Path | None = None) -> Path:
 
 
 _NESTED_KEYS = {
+    "kv.repo": ("kv", "repo", str),
+    "kv.table": ("kv", "table", str),
     "split.min_pages_to_split": ("split", "min_pages_to_split", int),
     "split.max_pages_per_chunk": ("split", "max_pages_per_chunk", int),
     "llm.model": ("llm", "model", str),
@@ -175,13 +193,14 @@ _NESTED_KEYS = {
 
 
 def apply_kv_update(config: AppConfig, key: str, value: str) -> None:
-    if key in {"inbox", "library", "metadata", "note_prompt"}:
+    if key in {"inbox", "library", "note_prompt"}:
         setattr(config, key, value)
         return
-    if key == "database":
-        # legacy alias from earlier design — treat as `metadata`
-        config.metadata = value
-        return
+    if key in {"metadata", "database"}:
+        # Removed in the gitkv migration; the store is now a git clone, not a folder.
+        raise KeyError(
+            f"'{key}' is no longer used. Set 'kv.repo' to a gitkv clone instead."
+        )
     if key == "bucket_capacity":
         config.bucket_capacity = int(value)
         return

@@ -1,6 +1,11 @@
 # Learning Buddy — Design v2
 
-A local agent that ingests files dropped into an inbox folder, classifies them with an LLM, organizes them into a library hierarchy, and reconciles the result into NotebookLM. All bookkeeping lives in plain JSON files. No git. No daemon. One CLI verb.
+A local agent that ingests files dropped into an inbox folder, classifies them with an LLM, organizes them into a library hierarchy, and reconciles the result into NotebookLM. All bookkeeping lives in a git-backed key-value store (`gitkv`) — see [GITKV_MIGRATION.md](GITKV_MIGRATION.md) for the storage layout and schema. No daemon. One CLI verb.
+
+> Note: this file describes the v2 control flow and JSON record shapes, which are
+> unchanged. The persistence sections below ("plain JSON files", "No git",
+> `metadata/` folder) were superseded by the gitkv migration (v0.3.0); the records
+> now live as `resources/<id>/meta` and `resources/<id>/queue` blobs in gitkv.
 
 ## Three folders, configured once
 

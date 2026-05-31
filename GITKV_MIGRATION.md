@@ -1,6 +1,9 @@
 # Learning Buddy — gitkv Storage Migration & Data Schema
 
-Status: **plan / design doc** (no application code changed yet).
+Status: **implemented** (v0.3.0). Code: `learning_buddy/store.py`,
+`learning_buddy/catalog.py`, `config.py`, `agent.py`, `cli.py`; tests in
+`tests/test_catalog.py` and `tests/test_store_gitkv.py`. This doc remains the
+schema + layout reference.
 
 This document specifies how Learning Buddy's metadata moves from the current
 plain-JSON-on-disk store to a Git-backed key-value store
@@ -437,12 +440,14 @@ a free "rebuild the index from the per-file blobs" recovery/repair path.
 
 **Tradeoffs**
 
-- **Commit volume:** each `save()` is a commit + push. We save **per resource
-  per run**, not per task (matching today's code — Phase B advances all of a
-  resource's tasks, then writes its `queue` once), so a run produces roughly
-  `(#new inbox files) + (#active resources)×(1 queue + ≤1 meta)` commits, **not**
-  one per task. See §13 for the full cost breakdown. Still chattier than today's
-  single JSON write, which is the price of the audit trail.
+- **Commit volume:** each `save()` is a commit + push. Phase B saves the `queue`
+  **after every task advance** (`agent.py` writes `rf.save()` per upload/artifact
+  step — deliberate, so a crash can't lose an NLM `artifact_id` and re-create a
+  duplicate). So **run 1** of a resource with `S` sources × `T` tasks costs on
+  the order of `S×T` queue commits + a couple of `meta` commits; **steady-state**
+  runs collapse to near-zero via the `Store.write` no-op guard. For a 70-chapter
+  book this means hundreds of commits/pushes on the first drain — see §13 and the
+  batching follow-up in §7's open items.
 - **Network on the hot path:** auto-push means a `run` needs the remote
   reachable. A non-fast-forward push retries via CAS; worst case a run errors and
   is simply re-run.
@@ -461,6 +466,15 @@ a free "rebuild the index from the per-file blobs" recovery/repair path.
    vs the single-blob or monolithic-`catalog` variants (§5).
 5. Ordering: in-memory sort by `created_at` (§4.1, recommended) vs sortable
    keys.
+6. **(open)** Batch the `queue` write to once-per-resource-per-run to cut
+   first-drain commit volume (§13), weighed against duplicate-artifact crash
+   risk. Currently per-task.
+
+Decisions taken in the v0.3.0 implementation: per-file `resources/<id>/{meta,
+queue}` layout (§4); `created_at` in-memory ordering (§4.1); `fcntl` lock kept,
+relocated to `<kv.repo>/.git/.learning-buddy.lock`; `learning-buddy migrate
+--from <dir>` one-shot import; `gitkv` pinned to `v0.4.0`. `kv.repo` is required
+config with no default.
 
 ---
 
@@ -644,18 +658,23 @@ Book "Deep Learning", id `f_a1b2c3d4ef`, split into 3 chapters × 6 tasks.
   ]
 }
 ```
-→ commit `Set key: resources/f_a1b2c3d4ef/queue` (create + advance saved once)
-→ commit `Set key: resources/f_a1b2c3d4ef/meta` (overall_status NEW → IN_PROGRESS)
+→ commits: `meta` (status NEW → IN_PROGRESS), then a `queue` write **after each
+task advance** (upload + 5 artifact kick-offs). For this 1-source × 6-task book,
+run 1 lands ~6 `queue` commits + 2 `meta` commits on top of the intake `meta`.
+Verified end-to-end: a real run produced a 19-commit chain on `origin`
+(`Set key: …/meta` / `…/queue`), confirming the audit trail.
 
-Run-1 commit count for this book: **3** (1 intake meta + 1 queue + 1 status meta).
+**Run 2..N (cron):** Phase A no-op; Phase B re-verifies PROCESSING tasks. A
+still-rendering video → no state change → the no-op guard skips the write → **0
+commits** that run.
 
-**Run 2..N (cron):** Phase A no-op; Phase B re-verifies PROCESSING tasks, writes
-`queue` once if anything changed. A still-rendering video → no change → **0
-commits** that run (the `Store.write` no-op guard skips identical content).
-
-**Run F (final):** last task flips to DONE → `queue` write (1) + `meta`
-status IN_PROGRESS → DONE (1) = **2 commits**. Subsequent runs skip the entry
+**Run F (final):** the remaining artifacts flip to DONE → a `queue` write per
+verified task + one `meta` IN_PROGRESS → DONE. Subsequent runs skip the entry
 entirely (`overall_status == DONE` not in `UNFINISHED`).
+
+> Note: the local clone is a **partial clone** — `git log` there shows only
+> grafted tips; the full chain lives on `origin` (`git -C origin.git log <log
+> branch>`).
 
 The book's entire history is `git log -- resources/f_a1b2c3d4ef/` on the active
 log branch.
@@ -747,22 +766,31 @@ tree; the worst case is a lost *update* to one blob, never a torn write.
 ## 13. Cost per run (git ops)
 
 Let `A` = new inbox files this run, `R` = active (unfinished) resources,
-`Rc` = resources whose status changed this run.
+`Tc` = task advances that changed state this run, `Rc` = resources whose status
+changed.
 
 | operation | reads (fetch) | writes (commit + push) |
 |---|---|---|
 | load index | 1 × `list_items("resources/")` | — |
 | Phase A intake | — | `A` (one `meta` each) |
 | Phase B load queues | `R` (one `read` each) | — |
-| Phase B advance | live NLM calls (unchanged) | ≤ `R` queue + `Rc` meta |
-| **total** | `1 + R` | `A + R + Rc` (worst case) |
+| Phase B advance | live NLM calls (unchanged) | `Tc` queue + `Rc` meta |
+| **total** | `1 + R` | `A + Tc + Rc` |
 
-In steady state (nothing new, things still rendering), the `Store.write` no-op
-guard drops unchanged-`queue` writes to **0 commits**. gitkv's `list_keys` is
-tree-only (no blob fetch); `list_items` fetches blobs on the active branch and
-is **partial-clone compatible**, so a large history doesn't bloat the working
-read. Log rotation only kicks in at `DEFAULT_ROTATION_THRESHOLD = 10000` commits
-per branch — years away at cron cadence.
+`Tc` is the catch: on a resource's **first** drain every task changes, so a book
+split into `S` chapters costs ~`S × len(artifacts+1)` queue commits that run.
+In **steady state** (nothing new, artifacts still rendering) the `Store.write`
+no-op guard drops unchanged writes to **0 commits**. gitkv's `list_keys` is
+tree-only (no blob fetch); `list_items` fetches blobs on the active branch and is
+**partial-clone compatible**, so a large history doesn't bloat the working read.
+Log rotation only kicks in at `DEFAULT_ROTATION_THRESHOLD = 10000` commits per
+branch — years away at cron cadence.
+
+**Follow-up (not done):** to cut first-drain commit volume, batch the `queue`
+write to once per resource per run instead of per task. The tradeoff is crash
+recovery — a per-task save guarantees a created NLM `artifact_id` is persisted
+before the next kick-off, avoiding duplicate artifacts; batching widens that
+window. Left as a conscious follow-up.
 
 ---
 

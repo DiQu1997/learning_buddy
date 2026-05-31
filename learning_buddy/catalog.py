@@ -1,24 +1,27 @@
 """
-Metadata store: catalog.json (top-level index) + resources/<id>.json (per-resource task queue).
+Metadata store, backed by gitkv. Two blobs per resource:
 
-Plain JSON, atomic writes via tmp+rename. No git. See DESIGN_V2.md for the schema and the
-state machine.
+    resources/<id>/meta    -> catalog row (index fields + overall_status)  → `Catalog`
+    resources/<id>/queue   -> task queue  (notebook_id + sources[] + tasks) → `ResourceFile`
+
+The `Catalog` index is *derived* — there is no monolithic catalog document. It is
+rebuilt in memory from the per-resource `meta` blobs, and each mutation writes the
+affected `meta` blob immediately (every write is a gitkv commit). Ordering is not
+implied by the keys (gitkv lists lexicographically by random id), so `resources`
+is sorted by `created_at`. See GITKV_MIGRATION.md for the full schema.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Iterable
 
+from .store import Store, meta_key, queue_key
 from .utils import utc_now_iso
 
 
-CATALOG_FILENAME = "catalog.json"
-RESOURCES_DIRNAME = "resources"
 CATALOG_VERSION = 1
 
 # overall_status values for a catalog row
@@ -37,13 +40,6 @@ TASK_FAILED = "FAILED"
 TASK_STATES = (NOT_STARTED, PROCESSING, TASK_DONE, TASK_FAILED)
 
 
-def _atomic_write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-
-
 def _dump_json(data: Any) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False)
 
@@ -53,60 +49,47 @@ def new_resource_id() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Catalog (the top-level index)
+# Catalog (the derived top-level index)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class Catalog:
-    metadata_dir: Path
-    data: dict[str, Any]
+    store: Store
+    _by_id: dict[str, dict[str, Any]]
 
     @classmethod
-    def load(cls, metadata_dir: Path) -> "Catalog":
-        metadata_dir = Path(metadata_dir).expanduser()
-        path = metadata_dir / CATALOG_FILENAME
-        if path.exists():
-            data = json.loads(path.read_text(encoding="utf-8"))
-        else:
-            data = {
-                "version": CATALOG_VERSION,
-                "updated_at": utc_now_iso(),
-                "resources": [],
-            }
-        return cls(metadata_dir=metadata_dir, data=data)
-
-    @property
-    def path(self) -> Path:
-        return self.metadata_dir / CATALOG_FILENAME
-
-    @property
-    def resources_dir(self) -> Path:
-        return self.metadata_dir / RESOURCES_DIRNAME
+    def load(cls, store: Store) -> "Catalog":
+        by_id: dict[str, dict[str, Any]] = {}
+        for text in store.iter_meta():
+            entry = json.loads(text)
+            rid = entry.get("id")
+            if rid:
+                by_id[rid] = entry
+        return cls(store=store, _by_id=by_id)
 
     @property
     def resources(self) -> list[dict[str, Any]]:
-        return self.data.setdefault("resources", [])
+        # Keys carry no creation order (random ids), so sort explicitly.
+        return sorted(
+            self._by_id.values(),
+            key=lambda e: (e.get("created_at") or "", e.get("id") or ""),
+        )
 
-    # ---- save ----
-
-    def save(self) -> None:
-        self.data["updated_at"] = utc_now_iso()
-        _atomic_write(self.path, _dump_json(self.data))
+    def _persist(self, entry: dict[str, Any]) -> None:
+        self._by_id[entry["id"]] = entry
+        self.store.write(meta_key(entry["id"]), _dump_json(entry))
 
     # ---- queries ----
 
     def find_by_sha(self, sha256: str) -> dict[str, Any] | None:
-        for entry in self.resources:
+        for entry in self._by_id.values():
             if entry.get("sha256") == sha256:
                 return entry
         return None
 
     def find_by_id(self, resource_id: str) -> dict[str, Any] | None:
-        for entry in self.resources:
-            if entry.get("id") == resource_id:
-                return entry
-        return None
+        return self._by_id.get(resource_id)
 
     def list_unfinished(self) -> list[dict[str, Any]]:
         return [e for e in self.resources if e.get("overall_status") in UNFINISHED]
@@ -142,7 +125,7 @@ class Catalog:
         ]
 
     def counts(self) -> dict[str, int]:
-        rs = self.resources
+        rs = list(self._by_id.values())
         return {
             "total": len(rs),
             "new": sum(1 for r in rs if r.get("overall_status") == NEW),
@@ -151,7 +134,7 @@ class Catalog:
             "failed": sum(1 for r in rs if r.get("overall_status") == FAILED),
         }
 
-    # ---- mutations ----
+    # ---- mutations (each writes its meta blob immediately) ----
 
     def add_resource(
         self,
@@ -180,7 +163,7 @@ class Catalog:
             "created_at": now,
             "updated_at": now,
         }
-        self.resources.append(entry)
+        self._persist(entry)
         return entry
 
     def set_overall_status(self, entry: dict[str, Any], status: str) -> None:
@@ -188,6 +171,12 @@ class Catalog:
             raise ValueError(f"unknown overall_status: {status}")
         entry["overall_status"] = status
         entry["updated_at"] = utc_now_iso()
+        self._persist(entry)
+
+    def touch(self, entry: dict[str, Any]) -> None:
+        """Persist an in-place mutation of `entry` (e.g. a rewritten library_path)."""
+        entry["updated_at"] = utc_now_iso()
+        self._persist(entry)
 
 
 # ---------------------------------------------------------------------------
@@ -197,49 +186,41 @@ class Catalog:
 
 @dataclass
 class ResourceFile:
-    metadata_dir: Path
+    store: Store
     resource_id: str
     data: dict[str, Any]
 
     @classmethod
-    def path_for(cls, metadata_dir: Path, resource_id: str) -> Path:
-        return Path(metadata_dir).expanduser() / RESOURCES_DIRNAME / f"{resource_id}.json"
+    def exists(cls, store: Store, resource_id: str) -> bool:
+        return store.read(queue_key(resource_id)) is not None
 
     @classmethod
-    def exists(cls, metadata_dir: Path, resource_id: str) -> bool:
-        return cls.path_for(metadata_dir, resource_id).exists()
-
-    @classmethod
-    def load(cls, metadata_dir: Path, resource_id: str) -> "ResourceFile":
-        path = cls.path_for(metadata_dir, resource_id)
-        if not path.exists():
-            raise FileNotFoundError(f"resource file does not exist: {path}")
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return cls(metadata_dir=Path(metadata_dir).expanduser(), resource_id=resource_id, data=data)
+    def load(cls, store: Store, resource_id: str) -> "ResourceFile":
+        text = store.read(queue_key(resource_id))
+        if text is None:
+            raise FileNotFoundError(f"resource queue does not exist: {resource_id}")
+        return cls(store=store, resource_id=resource_id, data=json.loads(text))
 
     @classmethod
     def create(
         cls,
-        metadata_dir: Path,
+        store: Store,
         resource_id: str,
         *,
         notebook_id: str | None,
         sources: list[dict[str, Any]],
     ) -> "ResourceFile":
+        now = utc_now_iso()
         data = {
             "resource_id": resource_id,
             "notebook_id": notebook_id,
-            "created_at": utc_now_iso(),
-            "updated_at": utc_now_iso(),
+            "created_at": now,
+            "updated_at": now,
             "sources": sources,
         }
-        rf = cls(metadata_dir=Path(metadata_dir).expanduser(), resource_id=resource_id, data=data)
+        rf = cls(store=store, resource_id=resource_id, data=data)
         rf.save()
         return rf
-
-    @property
-    def path(self) -> Path:
-        return self.path_for(self.metadata_dir, self.resource_id)
 
     @property
     def notebook_id(self) -> str | None:
@@ -255,7 +236,7 @@ class ResourceFile:
 
     def save(self) -> None:
         self.data["updated_at"] = utc_now_iso()
-        _atomic_write(self.path, _dump_json(self.data))
+        self.store.write(queue_key(self.resource_id), _dump_json(self.data))
 
     # ---- iterators / aggregations ----
 
